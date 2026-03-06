@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["scenario_id", "verdict", "satisfaction_score", "criteria_results", "anti_patterns_detected", "notes"],
+  "additionalProperties": false,
+  "properties": {
+    "scenario_id": {
+      "type": "string",
+      "description": "The unique identifier for the scenario being judged"
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["satisfied", "unsatisfied", "insufficient_evidence"],
+      "description": "Overall judgment for this scenario"
+    },
+    "satisfaction_score": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Confidence-weighted satisfaction score from 0 to 1"
+    },
+    "criteria_results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["criterion", "met", "evidence"],
+        "additionalProperties": false,
+        "properties": {
+          "criterion": {
+            "type": "string",
+            "description": "The satisfaction criterion being evaluated"
+          },
+          "met": {
+            "type": ["boolean", "null"],
+            "description": "Whether the criterion was met. null if insufficient evidence."
+          },
+          "evidence": {
+            "type": "string",
+            "description": "Specific evidence from the trace supporting this judgment"
+          }
+        }
+      },
+      "description": "Per-criterion evaluation results"
+    },
+    "anti_patterns_detected": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "List of anti-patterns observed in the trace"
+    },
+    "notes": {
+      "type": "string",
+      "description": "Free-form observations and reasoning about the judgment"
+    }
+  }
+}
