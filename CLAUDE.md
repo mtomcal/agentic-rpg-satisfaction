@@ -11,18 +11,24 @@ The full spec lives at `specs/satisfaction-harness-spec.md`.
 ## Key Commands
 
 ```bash
-# Capture traces
-bash capture-manual.sh <recording.mp4> <scenario-id>   # Mode A: from screen recording
-bash capture-agent.sh <scenario-id|all> [run-count]     # Mode B: automated via Playwright MCP
+make help                # Show all targets
 
-# Judge
-bash judge.sh <scenario-id> [trace-dir]                 # Single scenario
-bash run.sh                                              # All scenarios, produces report.json
+make capture             # Agent capture (default scenario)
+make capture SCENARIO=x  # Agent capture (specific scenario)
+make capture-all RUNS=3  # All scenarios, 3 runs each
+make capture-manual RECORDING=file.mp4 SCENARIO=x  # From screen recording
+
+make judge SCENARIO=x    # Judge single scenario
+make run                 # Judge all scenarios, produce report + failures.jsonl
+
+make clean               # Delete all traces and judgments
+make clean-traces        # Delete traces only
+make clean-judgments      # Delete judgments only
 ```
 
 ## Architecture
 
-The pipeline is: **Capture → Trace → Judge → Report**.
+The pipeline is: **Capture → Trace → Judge → Validate → Report**.
 
 1. **Scenarios** (`scenarios/*.md`) — Markdown with YAML frontmatter (`id`, `category`, `priority`, `timeout`, `setup`). Each has Steps, Satisfaction Criteria (keyed by ID like `character_created`), and Anti-Patterns.
 
@@ -36,11 +42,21 @@ The pipeline is: **Capture → Trace → Judge → Report**.
    - `--allowedTools ""` (no tools — pure reasoning)
    - Output goes to `judgments/<timestamp>/<scenario-id>.json`
 
-4. **Report** (`run.sh` only): tallies verdicts, flags critical failures (scenarios with `priority: critical`), writes `judgments/<timestamp>/report.json`, exits non-zero on critical failures.
+4. **Validate** (`extract-judgment.py`): extracts JSON from claude CLI envelope, normalizes schema variants (e.g. `criteria` object → `criteria_results` array), validates against `judgment-schema.json` using `jsonschema`. On validation failure, feeds the error back to Claude for self-correction (up to 2 retries).
+
+5. **Report** (`run.sh` only): tallies verdicts, flags critical failures (scenarios with `priority: critical`), writes `judgments/<timestamp>/report.json` and `failures.jsonl`, exits non-zero on critical failures.
+
+## Anti-Contamination
+
+All `claude -p` calls run from a `(cd /tmp && ...)` subshell to prevent the spawned Claude from reading `CLAUDE.md` or other repo files. This avoids biasing the judge or capture agent with harness-internal knowledge.
 
 ## Judgment Schema
 
 Verdicts: `satisfied`, `unsatisfied`, `insufficient_evidence`. Score is 0–1. Each criterion result has `met` (bool or null) and `evidence` (specific citation). Anti-patterns auto-fail related criteria.
+
+## Failures Output
+
+`run.sh` produces `judgments/<timestamp>/failures.jsonl` — one JSON line per failed criterion across all scenarios. Each line includes `scenario_id`, `criterion`, `evidence`, `anti_patterns`, `priority`, `scenario_file`, and `notes`. Designed to be passed directly to coding agents for fixing.
 
 ## Adding a New Scenario
 
@@ -48,4 +64,4 @@ Create `scenarios/<id>.md` with the same structure as `character-story-creation.
 
 ## Dependencies
 
-All scripts use `claude` CLI (Claude Code), `python3` (JSON processing), and `bash`. `capture-manual.sh` also needs `ffmpeg`. `capture-agent.sh` needs Playwright MCP configured.
+All scripts use `claude` CLI (Claude Code), `python3` (with `jsonschema` package), and `bash`. `capture-manual.sh` also needs `ffmpeg`. `capture-agent.sh` needs Playwright MCP configured.
