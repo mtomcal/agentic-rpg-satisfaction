@@ -196,6 +196,26 @@ for c in d['criteria_results']:
         echo ""
         echo "  *** CRITICAL FAILURE ***"
       fi
+      # Append failed criteria to failures JSONL
+      python3 -c "
+import json, sys
+judgment = json.load(open(sys.argv[1]))
+scenario_file = sys.argv[2]
+for c in judgment['criteria_results']:
+    if c.get('met') is not True:
+        line = {
+            'scenario_id': judgment['scenario_id'],
+            'criterion': c['criterion'],
+            'met': c['met'],
+            'evidence': c['evidence'],
+            'anti_patterns': judgment.get('anti_patterns_detected', []),
+            'satisfaction_score': judgment['satisfaction_score'],
+            'priority': sys.argv[3],
+            'scenario_file': scenario_file,
+            'notes': judgment.get('notes', '')
+        }
+        print(json.dumps(line))
+" "${CLEAN_OUTPUT}" "${SCENARIO_FILE}" "${PRIORITY:-normal}" >> "${JUDGMENT_DIR}/failures.jsonl"
       ;;
     insufficient_evidence)
       INSUFFICIENT=$((INSUFFICIENT + 1))
@@ -250,7 +270,11 @@ else
   fi
 fi
 echo ""
-echo "  Report: ${JUDGMENT_DIR}/report.json"
+echo "  Report:   ${JUDGMENT_DIR}/report.json"
+if [ -f "${JUDGMENT_DIR}/failures.jsonl" ]; then
+  FAILURE_COUNT=$(wc -l < "${JUDGMENT_DIR}/failures.jsonl")
+  echo "  Failures: ${JUDGMENT_DIR}/failures.jsonl (${FAILURE_COUNT} items)"
+fi
 echo ""
 
 # Exit with non-zero if any critical failures
