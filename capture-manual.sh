@@ -9,21 +9,34 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 TRACE_DIR="${SCRIPT_DIR}/traces/${SCENARIO_ID}/${TIMESTAMP}"
 
-mkdir -p "${TRACE_DIR}/frames"
+echo ""
+echo "========================================"
+echo "  CAPTURE MODE A — Manual (Recording)"
+echo "  $(date)"
+echo "========================================"
+echo ""
+echo "  Scenario:  ${SCENARIO_ID}"
+echo "  Recording: ${RECORDING}"
+echo "  Output:    ${TRACE_DIR}"
+echo ""
 
-echo "Extracting frames from ${RECORDING}..."
-# Extract one frame per second
+# --- Step 1: Extract frames ---
+echo "[1/4] Extracting frames from recording..."
+mkdir -p "${TRACE_DIR}/frames"
 ffmpeg -i "${RECORDING}" -vf "fps=1" -q:v 2 "${TRACE_DIR}/frames/frame_%04d.jpg" 2>/dev/null
 
 FRAME_COUNT=$(ls "${TRACE_DIR}/frames"/*.jpg 2>/dev/null | wc -l)
-echo "Extracted ${FRAME_COUNT} frames"
+echo "       Extracted ${FRAME_COUNT} frames (1 per second)"
 
 if [ "${FRAME_COUNT}" -eq 0 ]; then
-  echo "Error: No frames extracted from recording"
+  echo ""
+  echo "  ERROR: No frames extracted. Is the recording file valid?"
+  echo "         File: ${RECORDING}"
   exit 1
 fi
 
-# Sample frames evenly — take up to 20 frames spread across the recording
+# --- Step 2: Sample frames ---
+echo "[2/4] Sampling frames (max 20 evenly spaced)..."
 SAMPLED_DIR="${TRACE_DIR}/sampled"
 mkdir -p "${SAMPLED_DIR}"
 
@@ -41,18 +54,21 @@ else
 fi
 
 SAMPLED_COUNT=$(ls "${SAMPLED_DIR}"/*.jpg 2>/dev/null | wc -l)
-echo "Sampled ${SAMPLED_COUNT} frames for analysis"
+echo "       Selected ${SAMPLED_COUNT} frames for analysis"
 
-# Build the vision prompt with sampled frames
+# --- Step 3: Build frame arguments ---
+echo "[3/4] Preparing vision prompt..."
 FRAME_ARGS=""
 for f in "${SAMPLED_DIR}"/*.jpg; do
   FRAME_ARGS="${FRAME_ARGS} ${f}"
 done
 
-echo "Generating trace summary via claude..."
+# --- Step 4: Generate trace via Claude vision ---
+echo "[4/4] Sending frames to Claude for analysis..."
+echo "       This may take a minute..."
 
-# Use claude CLI with vision to describe the sampled frames
-claude -p "You are analyzing a screen recording of a web application interaction for scenario '${SCENARIO_ID}'.
+# Run from /tmp to prevent Claude from reading CLAUDE.md or repo files (anti-contamination)
+(cd /tmp && claude -p "You are analyzing a screen recording of a web application interaction for scenario '${SCENARIO_ID}'.
 
 These are sampled frames from the recording, in chronological order. For each frame, describe:
 1. What is visible on screen (UI elements, text content, layout)
@@ -62,8 +78,19 @@ These are sampled frames from the recording, in chronological order. For each fr
 After describing individual frames, provide a summary of the complete user flow observed.
 
 Focus on factual observations — what is literally visible — not interpretations." \
-  ${FRAME_ARGS} \
+  ${FRAME_ARGS}) \
   > "${TRACE_DIR}/trace-summary.md"
 
-echo "Trace saved to ${TRACE_DIR}/trace-summary.md"
-echo "Done."
+TRACE_SIZE=$(wc -c < "${TRACE_DIR}/trace-summary.md")
+TRACE_LINES=$(wc -l < "${TRACE_DIR}/trace-summary.md")
+
+echo ""
+echo "========================================"
+echo "  CAPTURE COMPLETE"
+echo "========================================"
+echo ""
+echo "  Trace: ${TRACE_DIR}/trace-summary.md"
+echo "  Size:  ${TRACE_SIZE} bytes, ${TRACE_LINES} lines"
+echo ""
+echo "  Next step: bash judge.sh ${SCENARIO_ID}"
+echo ""

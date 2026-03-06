@@ -30,3 +30,7 @@ You must determine whether the scenario's satisfaction criteria were met based s
    - 0.0 = complete failure or no usable evidence
 
 7. **Default to unsatisfied.** When evidence is ambiguous, lean toward "unsatisfied" rather than "satisfied." The burden of proof is on the application.
+
+## Output Format
+
+You MUST respond with ONLY a single valid JSON object. No prose, no markdown fences, no explanation outside the JSON. Your entire response is the JSON object.

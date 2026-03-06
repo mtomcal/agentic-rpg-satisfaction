@@ -16,45 +16,68 @@ INSUFFICIENT=0
 TOTAL=0
 CRITICAL_FAILURES=()
 
-echo "========================================="
-echo "  Satisfaction Harness — Full Run"
-echo "  $(date)"
-echo "========================================="
 echo ""
+echo "=========================================="
+echo "  SATISFACTION HARNESS — Full Run"
+echo "  $(date)"
+echo "=========================================="
+echo ""
+
+# Count scenarios
+SCENARIO_COUNT=0
+for _ in "${SCENARIOS_DIR}"/*.md; do SCENARIO_COUNT=$((SCENARIO_COUNT + 1)); done
+echo "  Scenarios found: ${SCENARIO_COUNT}"
+echo "  Judgments dir:   ${JUDGMENT_DIR}"
+echo ""
+
+SCENARIO_NUM=0
 
 for SCENARIO_FILE in "${SCENARIOS_DIR}"/*.md; do
   SCENARIO_ID="$(basename "${SCENARIO_FILE}" .md)"
   TRACES_BASE="${TRACES_DIR}/${SCENARIO_ID}"
+  SCENARIO_NUM=$((SCENARIO_NUM + 1))
+  PRIORITY=$(sed -n 's/^priority: *//p' "${SCENARIO_FILE}" | tr -d '[:space:]')
 
-  echo "--- Scenario: ${SCENARIO_ID} ---"
+  echo "------------------------------------------"
+  echo "  [${SCENARIO_NUM}/${SCENARIO_COUNT}] ${SCENARIO_ID}"
+  echo "  Priority: ${PRIORITY:-normal}"
+  echo "------------------------------------------"
 
+  # --- Find trace ---
   if [ ! -d "${TRACES_BASE}" ]; then
-    echo "  SKIP: No traces found"
+    echo "  SKIP — no traces captured yet"
+    echo "  Run: bash capture-agent.sh ${SCENARIO_ID}"
     INSUFFICIENT=$((INSUFFICIENT + 1))
     TOTAL=$((TOTAL + 1))
+    echo ""
     continue
   fi
 
   TRACE_DIR="$(ls -1d "${TRACES_BASE}"/*/ 2>/dev/null | sort | tail -1)"
   if [ -z "${TRACE_DIR}" ]; then
-    echo "  SKIP: No trace directories found"
+    echo "  SKIP — no trace directories found"
     INSUFFICIENT=$((INSUFFICIENT + 1))
     TOTAL=$((TOTAL + 1))
+    echo ""
     continue
   fi
 
   TRACE_DIR="${TRACE_DIR%/}"
 
   if [ ! -f "${TRACE_DIR}/trace-summary.md" ]; then
-    echo "  SKIP: No trace-summary.md in ${TRACE_DIR}"
+    echo "  SKIP — no trace-summary.md in trace dir"
     INSUFFICIENT=$((INSUFFICIENT + 1))
     TOTAL=$((TOTAL + 1))
+    echo ""
     continue
   fi
 
-  echo "  Trace: ${TRACE_DIR}"
+  TRACE_LINES=$(wc -l < "${TRACE_DIR}/trace-summary.md")
+  echo "  Trace: $(basename "${TRACE_DIR}") (${TRACE_LINES} lines)"
 
-  # Read scenario and trace
+  # --- Judge ---
+  echo "  Judging... (sending to Claude, no tools)"
+
   SCENARIO_CONTENT="$(cat "${SCENARIO_FILE}")"
   TRACE_CONTENT="$(cat "${TRACE_DIR}/trace-summary.md")"
 
@@ -68,22 +91,99 @@ ${TRACE_CONTENT}
 
 # Your Task
 
-Evaluate the trace evidence against each satisfaction criterion listed in the scenario. Check for any anti-patterns. Return your judgment as JSON matching the required schema.
+Evaluate the trace evidence against each satisfaction criterion listed in the scenario. Check for any anti-patterns.
 
-The scenario_id is: ${SCENARIO_ID}"
+IMPORTANT: Your entire response must be a single valid JSON object — no prose, no markdown, no explanation. Output ONLY the JSON object matching this schema:
 
-  claude -p "${JUDGE_INPUT}" \
-    --output-format json \
-    --system-prompt-file "${SCRIPT_DIR}/judge-prompt.md" \
-    --json-schema "$(cat "${SCRIPT_DIR}/judgment-schema.json")" \
-    --allowedTools "" \
-    > "${JUDGMENT_DIR}/${SCENARIO_ID}.json"
+{
+  \"scenario_id\": \"${SCENARIO_ID}\",
+  \"verdict\": \"satisfied|unsatisfied|insufficient_evidence\",
+  \"satisfaction_score\": 0.0-1.0,
+  \"criteria_results\": [{\"criterion\": \"id\", \"met\": true/false/null, \"evidence\": \"specific citation\"}],
+  \"anti_patterns_detected\": [\"description\"],
+  \"notes\": \"reasoning\"
+}"
 
-  # Extract verdict
-  VERDICT=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['verdict'])" "${JUDGMENT_DIR}/${SCENARIO_ID}.json" 2>/dev/null || echo "unknown")
-  SCORE=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['satisfaction_score'])" "${JUDGMENT_DIR}/${SCENARIO_ID}.json" 2>/dev/null || echo "0")
+  RAW_OUTPUT="${JUDGMENT_DIR}/${SCENARIO_ID}.raw.json"
+  CLEAN_OUTPUT="${JUDGMENT_DIR}/${SCENARIO_ID}.json"
+  MAX_RETRIES=2
+  CURRENT_PROMPT="${JUDGE_INPUT}"
+  JUDGE_OK=false
 
-  echo "  Verdict: ${VERDICT} (score: ${SCORE})"
+  for ATTEMPT in $(seq 0 "${MAX_RETRIES}"); do
+    if [ "${ATTEMPT}" -gt 0 ]; then
+      echo "  Retry ${ATTEMPT}/${MAX_RETRIES} — feeding validation error back to Claude..."
+    fi
+
+    # Run from /tmp to prevent Claude from reading CLAUDE.md or repo files (anti-contamination)
+    (cd /tmp && claude -p "${CURRENT_PROMPT}" \
+      --output-format json \
+      --system-prompt-file "${SCRIPT_DIR}/judge-prompt.md" \
+      --json-schema "$(cat "${SCRIPT_DIR}/judgment-schema.json")" \
+      --allowedTools "") \
+      > "${RAW_OUTPUT}"
+
+    EXTRACT_RESULT=$(python3 "${SCRIPT_DIR}/extract-judgment.py" "${RAW_OUTPUT}" "${CLEAN_OUTPUT}" 2>&1)
+
+    if [ $? -eq 0 ]; then
+      if [ "${ATTEMPT}" -gt 0 ]; then
+        echo "  Validation passed on retry ${ATTEMPT}"
+      fi
+      JUDGE_OK=true
+      break
+    fi
+
+    if [ "${ATTEMPT}" -lt "${MAX_RETRIES}" ]; then
+      INVALID_FILE="${CLEAN_OUTPUT}.invalid.json"
+      INVALID_JSON=""
+      if [ -f "${INVALID_FILE}" ]; then
+        INVALID_JSON="$(cat "${INVALID_FILE}")"
+      fi
+
+      CURRENT_PROMPT="Your previous JSON output failed schema validation.
+
+ERROR: ${EXTRACT_RESULT}
+
+Your previous output:
+${INVALID_JSON}
+
+The JSON schema requires:
+$(cat "${SCRIPT_DIR}/judgment-schema.json")
+
+Fix the JSON to pass validation. Output ONLY the corrected JSON object — no prose, no markdown fences, no explanation."
+
+      echo "  Validation failed, retrying with error feedback..."
+    fi
+  done
+
+  if [ "${JUDGE_OK}" != "true" ]; then
+    echo "  ERROR — failed to get valid judgment after $((MAX_RETRIES + 1)) attempts"
+    echo "  Raw output: ${RAW_OUTPUT}"
+    INSUFFICIENT=$((INSUFFICIENT + 1))
+    TOTAL=$((TOTAL + 1))
+    echo ""
+    continue
+  fi
+
+  # --- Display results ---
+  VERDICT=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['verdict'])" "${CLEAN_OUTPUT}")
+  SCORE=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['satisfaction_score'])" "${CLEAN_OUTPUT}")
+  CRITERIA_COUNT=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(len(d['criteria_results']))" "${CLEAN_OUTPUT}")
+  CRITERIA_MET=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(sum(1 for c in d['criteria_results'] if c.get('met') is True))" "${CLEAN_OUTPUT}")
+
+  echo ""
+  echo "  Verdict:      ${VERDICT}"
+  echo "  Score:        ${SCORE}"
+  echo "  Criteria met: ${CRITERIA_MET}/${CRITERIA_COUNT}"
+
+  # Show per-criterion one-liners
+  python3 -c "
+import json, sys
+d = json.load(open(sys.argv[1]))
+for c in d['criteria_results']:
+    status = 'PASS' if c.get('met') is True else ('FAIL' if c.get('met') is False else '????')
+    print(f'    {status}  {c[\"criterion\"]}')
+" "${CLEAN_OUTPUT}"
 
   case "${VERDICT}" in
     satisfied)
@@ -91,10 +191,10 @@ The scenario_id is: ${SCENARIO_ID}"
       ;;
     unsatisfied)
       UNSATISFIED=$((UNSATISFIED + 1))
-      # Check if this scenario is critical priority
-      PRIORITY=$(sed -n 's/^priority: *//p' "${SCENARIO_FILE}" | tr -d '[:space:]')
       if [ "${PRIORITY}" = "critical" ]; then
         CRITICAL_FAILURES+=("${SCENARIO_ID}")
+        echo ""
+        echo "  *** CRITICAL FAILURE ***"
       fi
       ;;
     insufficient_evidence)
@@ -109,11 +209,13 @@ The scenario_id is: ${SCENARIO_ID}"
   echo ""
 done
 
-# Build report
+# --- Build report ---
 CRITICAL_JSON="[]"
 if [ ${#CRITICAL_FAILURES[@]} -gt 0 ]; then
   CRITICAL_JSON=$(printf '%s\n' "${CRITICAL_FAILURES[@]}" | python3 -c "import json,sys; print(json.dumps([l.strip() for l in sys.stdin]))")
 fi
+
+PASS=$([ ${UNSATISFIED} -eq 0 ] && [ ${#CRITICAL_FAILURES[@]} -eq 0 ] && echo "true" || echo "false")
 
 REPORT=$(cat <<EOF
 {
@@ -123,22 +225,33 @@ REPORT=$(cat <<EOF
   "unsatisfied": ${UNSATISFIED},
   "insufficient_evidence": ${INSUFFICIENT},
   "critical_failures": ${CRITICAL_JSON},
-  "pass": $([ ${UNSATISFIED} -eq 0 ] && [ ${#CRITICAL_FAILURES[@]} -eq 0 ] && echo "true" || echo "false")
+  "pass": ${PASS}
 }
 EOF
 )
 
 echo "${REPORT}" | python3 -m json.tool > "${JUDGMENT_DIR}/report.json"
 
-echo "========================================="
-echo "  Results: ${SATISFIED}/${TOTAL} satisfied"
-echo "  Unsatisfied: ${UNSATISFIED}"
-echo "  Insufficient evidence: ${INSUFFICIENT}"
-if [ ${#CRITICAL_FAILURES[@]} -gt 0 ]; then
-  echo "  CRITICAL FAILURES: ${CRITICAL_FAILURES[*]}"
+echo "=========================================="
+echo "  RESULTS SUMMARY"
+echo "=========================================="
+echo ""
+echo "  Total scenarios: ${TOTAL}"
+echo "  Satisfied:       ${SATISFIED}"
+echo "  Unsatisfied:     ${UNSATISFIED}"
+echo "  No evidence:     ${INSUFFICIENT}"
+echo ""
+if [ "${PASS}" = "true" ]; then
+  echo "  Overall: PASS"
+else
+  echo "  Overall: FAIL"
+  if [ ${#CRITICAL_FAILURES[@]} -gt 0 ]; then
+    echo "  Critical failures: ${CRITICAL_FAILURES[*]}"
+  fi
 fi
+echo ""
 echo "  Report: ${JUDGMENT_DIR}/report.json"
-echo "========================================="
+echo ""
 
 # Exit with non-zero if any critical failures
 if [ ${#CRITICAL_FAILURES[@]} -gt 0 ]; then
