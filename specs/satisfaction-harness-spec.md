@@ -79,21 +79,27 @@ The sweet spot is high-velocity development on a product where behavioral correc
 │  │  ├── edge-error.md                            │
 │  │  └── adversarial.md                           │
 │  traces/               ← capture output          │
-│  │  └── <timestamp>/<scenario_id>/               │
-│  │      ├── manifest.json                        │
+│  │  └── <scenario_id>/<timestamp>/               │
 │  │      ├── trace-summary.md                     │
-│  │      ├── frame-*.jpg  (Mode A)                │
-│  │      ├── step-*.png   (Mode B)                │
-│  │      └── run-01/ ... run-05/  (multi-run B)   │
+│  │      ├── trace-raw.json  (Mode B stream)      │
+│  │      ├── frames/        (Mode A: all frames)  │
+│  │      ├── sampled/       (Mode A: sampled)     │
+│  │      └── capture-stderr.log  (Mode B)         │
 │  judgments/             ← judge output            │
 │  │  └── <timestamp>/                             │
-│  │      ├── *.judgment.json                      │
-│  │      └── report.json                          │
+│  │      ├── <scenario_id>.json                   │
+│  │      ├── <scenario_id>.raw.json               │
+│  │      ├── report.json                          │
+│  │      └── failures.jsonl                       │
 │  judge-prompt.md       ← judge system prompt      │
 │  judgment-schema.json  ← enforced output schema   │
 │  capture-manual.sh     ← Mode A: you record       │
 │  capture-agent.sh      ← Mode B: agent + PW MCP   │
-│  run.sh                ← orchestrator              │
+│  judge.sh              ← single-scenario judge     │
+│  run.sh                ← orchestrator (all)        │
+│  extract-judgment.py   ← JSON extraction + valid.  │
+│  stream-filter.py      ← real-time stream display  │
+│  Makefile              ← convenience targets        │
 └─────────────────────────────────────────────────┘
 
 Mode A — You record:
@@ -101,10 +107,18 @@ Mode A — You record:
 
 Mode B — Agent drives Playwright MCP (run N times):
   bash capture-agent.sh scenario-id 5
+  bash capture-agent.sh all 3        # all scenarios
 
 Judge (always the same):
   claude -p --system-prompt-file judge-prompt.md \
     --json-schema judgment-schema.json --allowedTools ""
+
+Makefile shortcuts:
+  make capture SCENARIO=x RUNS=n
+  make capture-all RUNS=3
+  make judge SCENARIO=x
+  make run
+  make clean
 ```
 
 **Key structural rule:** Scenarios live *outside* the codebase the agent edits. This is the holdout principle — the coding agent never sees the evaluation criteria, so it can't overfit to them.
@@ -115,23 +129,20 @@ Judge (always the same):
 
 A scenario is a natural-language user story with observable expectations. It's *not* a test — it doesn't prescribe implementation. It describes what a satisfied user would experience.
 
-### Format: `harness/scenarios/*.md`
+### Format: `scenarios/*.md`
 
 ```markdown
 ---
 id: new-user-onboarding
 category: happy-path
 priority: critical
-timeout: 30s
-setup: |
-  # bash commands to prepare state
-  curl -s -X POST http://localhost:3000/api/reset
-  curl -s -X POST http://localhost:3000/api/seed -d '{"user": "test@example.com"}'
+timeout: 120
+setup: App running at http://localhost:3000
 ---
 
 # New User Onboarding
 
-## Context
+## Description
 A first-time user visits the app, creates an account, and completes the
 setup wizard.
 
@@ -143,17 +154,24 @@ setup wizard.
 5. Arrive at the dashboard
 
 ## Satisfaction Criteria
-- The user reaches the dashboard within a reasonable number of interactions
-- No error messages are shown during the flow
-- The onboarding wizard clearly communicates progress (e.g., step 2 of 3)
-- The dashboard shows a personalized welcome or the user's name
-- The entire flow feels intentional, not broken or half-implemented
+- **dashboard_reached**: The user reaches the dashboard within a reasonable number of interactions
+- **no_errors**: No error messages are shown during the flow
+- **progress_shown**: The onboarding wizard clearly communicates progress (e.g., step 2 of 3)
+- **personalized**: The dashboard shows a personalized welcome or the user's name
+- **feels_complete**: The entire flow feels intentional, not broken or half-implemented
 
-## Anti-patterns (should NOT satisfy)
+## Anti-Patterns
 - Wizard steps that are blank or placeholder
 - Redirect loops or 404 pages
 - Dashboard loads but shows no user context
 ```
+
+**Key format requirements:**
+- The `id` in frontmatter must match the filename (e.g., `new-user-onboarding.md` has `id: new-user-onboarding`)
+- `timeout` is in seconds (numeric, no unit suffix)
+- `setup` is a plain-text description of preconditions, not executable commands
+- Satisfaction Criteria are keyed with bold IDs (e.g., `**criterion_id**`) — these appear in judgment output and `failures.jsonl`
+- The section is called `## Anti-Patterns` (not `## Anti-patterns`)
 
 ### Scenario Design Principles
 
@@ -173,7 +191,7 @@ Two capture modes. Both produce the same output structure — the judge doesn't 
 
 ### Mode A: You Supply a Screen Recording
 
-You manually use the app, record your screen, drop the file in. The harness extracts frames and generates a text description for the judge.
+You manually use the app, record your screen, drop the file in. The harness extracts frames, samples up to 20 evenly spaced, and sends them to Claude's vision to generate a text description for the judge.
 
 **When to use:** Exploratory testing, visual/experiential scenarios, anything where you want ground-truth human observation. Also useful for calibrating Mode B — record yourself, then compare what the agent captures for the same scenario.
 
@@ -185,77 +203,58 @@ set -euo pipefail
 
 RECORDING="$1"
 SCENARIO_ID="$2"
-HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
-TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%S")
-TRACE_DIR="$HARNESS_DIR/traces/$TIMESTAMP/$SCENARIO_ID"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+TRACE_DIR="${SCRIPT_DIR}/traces/${SCENARIO_ID}/${TIMESTAMP}"
 
-mkdir -p "$TRACE_DIR"
+mkdir -p "${TRACE_DIR}/frames"
 
 # ── Extract frames ──────────────────────────────────────
-# 1 fps for typical UI flows. Bump to 2-4 fps for fast interactions.
-FPS="${FPS:-1}"
+# 1 fps for typical UI flows.
+ffmpeg -i "${RECORDING}" -vf "fps=1" -q:v 2 "${TRACE_DIR}/frames/frame_%04d.jpg" 2>/dev/null
+FRAME_COUNT=$(ls "${TRACE_DIR}/frames"/*.jpg 2>/dev/null | wc -l)
 
-echo "Extracting frames at ${FPS}fps from $RECORDING..."
-ffmpeg -i "$RECORDING" \
-  -vf "fps=$FPS" \
-  -q:v 2 \
-  "$TRACE_DIR/frame-%04d.jpg" \
-  2>"$TRACE_DIR/ffmpeg.log"
+# ── Sample frames (max 20 evenly spaced) ───────────────
+SAMPLED_DIR="${TRACE_DIR}/sampled"
+mkdir -p "${SAMPLED_DIR}"
 
-FRAME_COUNT=$(ls "$TRACE_DIR"/frame-*.jpg 2>/dev/null | wc -l)
-cp "$RECORDING" "$TRACE_DIR/"
+if [ "${FRAME_COUNT}" -le 20 ]; then
+  cp "${TRACE_DIR}/frames"/*.jpg "${SAMPLED_DIR}/"
+else
+  STEP=$(( FRAME_COUNT / 20 ))
+  IDX=1
+  for f in "${TRACE_DIR}/frames"/*.jpg; do
+    if (( IDX % STEP == 0 )); then cp "$f" "${SAMPLED_DIR}/"; fi
+    IDX=$((IDX + 1))
+  done
+fi
 
-# ── Build manifest ──────────────────────────────────────
-jq -n \
-  --arg scenario_id "$SCENARIO_ID" \
-  --arg source "manual_recording" \
-  --arg recording "$(basename "$RECORDING")" \
-  --argjson frame_count "$FRAME_COUNT" \
-  --argjson fps "$FPS" \
-  --arg captured_at "$TIMESTAMP" \
-  '{
-    scenario_id: $scenario_id,
-    capture_mode: $source,
-    source_recording: $recording,
-    frame_count: $frame_count,
-    fps: $fps,
-    captured_at: $captured_at
-  }' > "$TRACE_DIR/manifest.json"
-
-# ── Describe frames ─────────────────────────────────────
-# A cheap Claude Code vision call that describes what's in the frames.
-# The judge reads this description, not the frames directly.
-
-# Sample ~10 key frames to keep costs down
-SAMPLE_INTERVAL=$(( FRAME_COUNT > 10 ? FRAME_COUNT / 10 : 1 ))
+# ── Describe frames via Claude vision ──────────────────
+# Collect sampled frame paths as arguments
 FRAME_ARGS=""
-IDX=0
-for frame in "$TRACE_DIR"/frame-*.jpg; do
-  if (( IDX % SAMPLE_INTERVAL == 0 )) || (( IDX == FRAME_COUNT - 1 )); then
-    FRAME_ARGS+="Frame $(basename "$frame"): @$frame "
-  fi
-  ((IDX++))
+for f in "${SAMPLED_DIR}"/*.jpg; do
+  FRAME_ARGS="${FRAME_ARGS} ${f}"
 done
 
-echo "Generating trace description from $((FRAME_COUNT < 10 ? FRAME_COUNT : 10)) sampled frames..."
+# Run from /tmp to prevent Claude from reading CLAUDE.md (anti-contamination)
+(cd /tmp && claude -p "You are analyzing a screen recording of a web application \
+interaction for scenario '${SCENARIO_ID}'.
 
-claude -p \
-  --append-system-prompt "You are examining screenshots of a web application. \
-Describe what you see in each frame: page layout, visible text, form states, \
-error messages, navigation state, any visual anomalies. Be factual and specific. \
-Output as markdown." \
-  "Describe these screenshots from scenario '${SCENARIO_ID}' in chronological order. \
-For each frame, note the page/state and relevant details." \
-  --allowedTools "Read" \
-  --output-format text \
-  > "$TRACE_DIR/trace-summary.md" \
-  2>"$TRACE_DIR/describe.stderr"
+These are sampled frames from the recording, in chronological order. For each frame, describe:
+1. What is visible on screen (UI elements, text content, layout)
+2. What action the user appears to have taken since the last frame
+3. Any errors, loading states, or unexpected behavior
 
-echo ""
-echo "  Frames: $FRAME_COUNT"
-echo "  Description: $TRACE_DIR/trace-summary.md"
-echo "  Trace dir: $TRACE_DIR"
+After describing individual frames, provide a summary of the complete user flow observed.
+
+Focus on factual observations — what is literally visible — not interpretations." \
+  ${FRAME_ARGS}) \
+  > "${TRACE_DIR}/trace-summary.md"
+
+echo "  Trace: ${TRACE_DIR}/trace-summary.md"
 ```
+
+**Note:** Traces are stored as `traces/<scenario_id>/<timestamp>/` (scenario first, then timestamp). This makes it easy to find the latest trace for any scenario. No `manifest.json` is generated — `trace-summary.md` is the only required capture artifact.
 
 ### Mode B: Agent Drives Playwright MCP (Automated, Repeatable)
 
@@ -282,138 +281,78 @@ This persists in your `~/.claude.json`. Every `claude` invocation (interactive o
 ```bash
 #!/usr/bin/env bash
 # capture-agent.sh
-# Usage: bash capture-agent.sh <scenario_id|"all"> [--runs N]
+# Usage: bash capture-agent.sh <scenario_id|"all"> [run_count]
 set -euo pipefail
 
-HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
-SCENARIO_ARG="${1:-all}"
-NUM_RUNS="${2:-1}"  # default 1 run; pass --runs 5 for multi-run
-if [ "$SCENARIO_ARG" = "--runs" ]; then
-  echo "Usage: bash capture-agent.sh <scenario_id|all> [N_runs]"
-  exit 1
-fi
-if [[ "${2:-}" =~ ^[0-9]+$ ]]; then
-  NUM_RUNS="$2"
-fi
+SCENARIO_ID="${1:?Usage: capture-agent.sh <scenario-id|all> [run-count]}"
+RUN_COUNT="${2:-1}"
 
-APP_URL="${APP_URL:-http://localhost:3000}"
-TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%S")
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCENARIOS_DIR="${SCRIPT_DIR}/scenarios"
 
-# ── Verify app is reachable ─────────────────────────────
-if ! curl -sf "$APP_URL" > /dev/null 2>&1; then
-  echo "✘ App not reachable at $APP_URL"
-  echo "  Start your dev server first, or set APP_URL."
-  exit 1
-fi
-
-# ── Collect scenarios ───────────────────────────────────
-if [ "$SCENARIO_ARG" = "all" ]; then
-  SCENARIOS=("$HARNESS_DIR"/scenarios/*.md)
+# Collect scenario files to process
+if [ "${SCENARIO_ID}" = "all" ]; then
+  SCENARIO_FILES=("${SCENARIOS_DIR}"/*.md)
 else
-  SCENARIOS=("$HARNESS_DIR/scenarios/${SCENARIO_ARG}.md")
+  SCENARIO_FILES=("${SCENARIOS_DIR}/${SCENARIO_ID}.md")
 fi
 
-echo "═══════════════════════════════════════════"
-echo "  Agent Capture: ${#SCENARIOS[@]} scenarios × $NUM_RUNS runs"
-echo "  App: $APP_URL"
-echo "═══════════════════════════════════════════"
+for SCENARIO_FILE in "${SCENARIO_FILES[@]}"; do
+  CURRENT_ID="$(basename "${SCENARIO_FILE}" .md)"
+  SCENARIO_CONTENT="$(cat "${SCENARIO_FILE}")"
 
-for scenario in "${SCENARIOS[@]}"; do
-  [ -f "$scenario" ] || continue
-  SCENARIO_ID=$(grep '^id:' "$scenario" | cut -d' ' -f2)
-  SCENARIO_CONTENT=$(cat "$scenario")
+  for RUN in $(seq 1 "${RUN_COUNT}"); do
+    TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+    TRACE_DIR="${SCRIPT_DIR}/traces/${CURRENT_ID}/${TIMESTAMP}"
+    mkdir -p "${TRACE_DIR}"
 
-  for ((RUN=1; RUN<=NUM_RUNS; RUN++)); do
-    RUN_LABEL="run-$(printf '%02d' $RUN)"
-    TRACE_DIR="$HARNESS_DIR/traces/$TIMESTAMP/$SCENARIO_ID/$RUN_LABEL"
-    mkdir -p "$TRACE_DIR"
+    CAPTURE_PROMPT="You are a QA tester using a web browser via Playwright MCP tools. \
+Your job is to execute the following test scenario and document everything you observe.
 
-    echo ""
-    echo "── $SCENARIO_ID ($RUN_LABEL of $NUM_RUNS) ──"
-
-    # ── Build the capture prompt ────────────────────────
-    CAPTURE_PROMPT="You are a QA tester. Use the Playwright MCP tools to drive a browser
-through the following scenario against ${APP_URL}.
-
-SCENARIO:
+## Scenario
 ${SCENARIO_CONTENT}
 
-INSTRUCTIONS:
-1. Open the browser to ${APP_URL}
-2. Follow the scenario steps described above using natural language navigation
-3. At each significant step, take a screenshot using the Playwright snapshot tool
-4. After completing (or failing) the scenario, write a detailed summary of
-   everything you observed
+## Instructions
+1. Follow the steps described in the scenario exactly
+2. After each step, take a screenshot and describe what you see
+3. Note any errors, unexpected behavior, or deviations from expected results
+4. If a step fails, still attempt remaining steps and document the failure
+5. At the end, write a complete trace summary
 
-CAPTURE RULES:
-- If a step fails (element not found, timeout, error page), screenshot the
-  current state and note the failure — do NOT stop. Continue to the next step.
-- Record any console errors or unexpected behavior you notice.
-- When done, write the following files to ${TRACE_DIR}/:
-  - trace-summary.md: your narrative of what happened at each step
-  - manifest.json: structured metadata about the run
-  - Any screenshots you captured (save as step-NN-description.png)
+## Output
+Write your complete trace (all observations, screenshots taken, and summary) as a \
+detailed markdown report. Be factual — describe what you literally see on screen."
 
-Be thorough. The evidence you capture will be evaluated by a separate judge."
+    # Run from /tmp to prevent Claude from reading CLAUDE.md (anti-contamination)
+    # Stream output to terminal via stream-filter.py, save final JSON for extraction
+    if (cd /tmp && claude -p "${CAPTURE_PROMPT}" \
+      --output-format stream-json --verbose \
+      --allowedTools "mcp__playwright__*") \
+      2>"${TRACE_DIR}/capture-stderr.log" \
+      | python3 "${SCRIPT_DIR}/stream-filter.py" "${TRACE_DIR}/trace-raw.json"; then
 
-    # ── Run the capture agent ──────────────────────────
-    RESULT=$(echo "$CAPTURE_PROMPT" | claude -p \
-      --append-system-prompt "You are a QA automation agent using Playwright MCP \
-to drive a browser. Navigate by interpreting plain-text scenario descriptions. \
-Use accessibility tree snapshots to find elements. Save all evidence to disk." \
-      --output-format json \
-      --allowedTools "mcp__playwright,Bash,Read,Write" \
-      2>"$TRACE_DIR/agent.stderr" \
-    )
-
-    # ── Capture metadata ───────────────────────────────
-    COST=$(echo "$RESULT" | jq -r '.total_cost_usd // 0')
-    DURATION=$(echo "$RESULT" | jq -r '.duration_ms // 0')
-    SESSION=$(echo "$RESULT" | jq -r '.session_id // "unknown"')
-    IS_ERROR=$(echo "$RESULT" | jq -r '.is_error // false')
-
-    echo "    Cost: \$${COST} | Duration: ${DURATION}ms | Error: ${IS_ERROR}"
-
-    # Write run metadata if the agent didn't create a manifest
-    if [ ! -f "$TRACE_DIR/manifest.json" ]; then
-      jq -n \
-        --arg scenario_id "$SCENARIO_ID" \
-        --arg run "$RUN_LABEL" \
-        --arg source "agent_playwright_mcp" \
-        --arg session_id "$SESSION" \
-        --argjson cost "$COST" \
-        --argjson duration_ms "$DURATION" \
-        --argjson is_error "$IS_ERROR" \
-        --arg captured_at "$TIMESTAMP" \
-        '{
-          scenario_id: $scenario_id,
-          run: $run,
-          capture_mode: $source,
-          agent_session_id: $session_id,
-          cost_usd: $cost,
-          duration_ms: $duration_ms,
-          agent_error: $is_error,
-          captured_at: $captured_at
-        }' > "$TRACE_DIR/manifest.json"
+      # Extract text result from the stream envelope
+      python3 -c "
+import json, sys
+data = json.load(open(sys.argv[1]))
+result = data.get('result', '')
+so = data.get('structured_output')
+if isinstance(so, str):
+    result = so
+print(result)
+" "${TRACE_DIR}/trace-raw.json" > "${TRACE_DIR}/trace-summary.md"
     fi
-
   done
 done
-
-# ── Multi-run summary ──────────────────────────────────
-if [ "$NUM_RUNS" -gt 1 ]; then
-  echo ""
-  echo "═══════════════════════════════════════════"
-  echo "  Multi-Run Summary"
-  echo "═══════════════════════════════════════════"
-  echo ""
-  echo "  Run the judge against each run separately."
-  echo "  If most runs show the same failure → app problem."
-  echo "  If results are inconsistent → agent flakiness."
-  echo "  Traces: $HARNESS_DIR/traces/$TIMESTAMP/"
-  echo "═══════════════════════════════════════════"
-fi
 ```
+
+**Key implementation details:**
+
+- **Anti-contamination:** All `claude -p` calls run from a `(cd /tmp && ...)` subshell so the spawned Claude cannot read `CLAUDE.md` or other repo files, which would bias the capture or judgment.
+- **Streaming output:** Uses `--output-format stream-json --verbose` piped through `stream-filter.py` to show real-time assistant text on the terminal while capturing the full result JSON for trace extraction.
+- **Tool restriction:** Only `mcp__playwright__*` tools are allowed — no file system access, no bash. The agent drives the browser and reports back; it doesn't write files to disk.
+- **Trace storage:** `traces/<scenario_id>/<timestamp>/` — scenario first, timestamp second. Each run gets its own timestamp directory. The judge always picks the latest one.
+- **No manifest.json:** The only required output is `trace-summary.md`, extracted from the agent's streamed response. No manifest, no screenshots saved to disk.
 
 #### The Multi-Run Pattern
 
@@ -423,45 +362,47 @@ This is the key differentiator from scripted tests. Because the agent *interpret
 # Run the onboarding scenario 5 times
 bash capture-agent.sh new-user-onboarding 5
 
-# Results:
-# traces/2026-03-06T14:22:00/new-user-onboarding/
-#   run-01/  ← agent reached dashboard, all steps completed
-#   run-02/  ← agent reached dashboard, all steps completed
-#   run-03/  ← agent couldn't find "Get Started" button (agent failure)
-#   run-04/  ← agent reached dashboard, wizard step 2 showed error
-#   run-05/  ← agent reached dashboard, wizard step 2 showed error
+# Results — each run gets its own timestamp:
+# traces/new-user-onboarding/
+#   20260306-142200/  ← agent reached dashboard, all steps completed
+#   20260306-142315/  ← agent reached dashboard, all steps completed
+#   20260306-142430/  ← agent couldn't find "Get Started" button (agent failure)
+#   20260306-142545/  ← agent reached dashboard, wizard step 2 showed error
+#   20260306-142700/  ← agent reached dashboard, wizard step 2 showed error
 
-# Runs 01, 02: satisfied (app works)
-# Run 03: discard (agent failure, not app failure)
-# Runs 04, 05: unsatisfied (real bug in wizard step 2)
+# Runs 1, 2: satisfied (app works)
+# Run 3: discard (agent failure, not app failure)
+# Runs 4, 5: unsatisfied (real bug in wizard step 2)
+# The judge (run.sh) uses the latest trace — judge individual runs with judge.sh
 ```
 
 The judge evaluates each run independently. You look at the spread of verdicts to decide what's signal. A scenario that's "unsatisfied" in 4/5 runs is a real bug. A scenario that's "unsatisfied" in 1/5 runs is probably agent noise — or a flaky app behavior worth investigating.
 
 ### Trace Output Structure (Both Modes)
 
-Regardless of capture mode, the judge expects:
+Regardless of capture mode, the judge expects `trace-summary.md` — the only required artifact:
 
 ```
-traces/<timestamp>/<scenario_id>/
-├── manifest.json            ← REQUIRED: what's in this trace
+traces/<scenario_id>/<timestamp>/
 ├── trace-summary.md         ← REQUIRED: text description of what happened
-├── frame-0001.jpg           ← Mode A: extracted video frames
-├── step-01-landing.png      ← Mode B: agent screenshots
-├── recording.mp4            ← Mode A: source recording
-└── agent.stderr             ← Mode B: agent error log
+├── trace-raw.json           ← Mode B: full stream-json output from claude
+├── capture-stderr.log       ← Mode B: agent error log
+├── frames/                  ← Mode A: all extracted frames (1fps)
+│   └── frame_0001.jpg ...
+└── sampled/                 ← Mode A: evenly sampled frames (up to 20)
+    └── frame_0001.jpg ...
 
 # Multi-run traces (Mode B with N>1):
-traces/<timestamp>/<scenario_id>/
-├── run-01/
-│   ├── manifest.json
-│   ├── trace-summary.md
-│   └── step-*.png
-├── run-02/
-│   ├── ...
+# Each run gets its own timestamp directory:
+traces/<scenario_id>/
+├── 20260306-142200/
+│   └── trace-summary.md
+├── 20260306-142415/
+│   └── trace-summary.md
+└── ...
 ```
 
-The `trace-summary.md` is the primary input for the judge — a natural-language narrative of what was observed. In Mode A, this is generated by a Claude Code vision call describing the frames. In Mode B, the capture agent writes it directly from its own observations during the browser session.
+The `trace-summary.md` is the sole input for the judge — a natural-language narrative of what was observed. In Mode A, this is generated by a Claude Code vision call describing sampled frames. In Mode B, it's extracted from the capture agent's streamed response text.
 
 ---
 
@@ -481,58 +422,104 @@ The `-p` flag turns Claude Code into a standard Unix CLI tool. You pipe in conte
 - **`--resume` enables multi-turn judgment** if you need the judge to re-evaluate after seeing additional evidence.
 - **Session IDs** in JSON output let you trace exactly which judge call produced which verdict.
 
-### The Judge System Prompt: `harness/judge-prompt.md`
+### The Judge System Prompt: `judge-prompt.md`
 
 Version-control this separately. It's the most important file in the harness.
 
 ```markdown
-You are a QA judge evaluating whether a software scenario satisfies its
-acceptance criteria. You will receive:
+# Satisfaction Judge — System Prompt
 
-1. The scenario context and what the user was trying to do
-2. The satisfaction criteria (what "good" looks like)
-3. Anti-patterns (what should NOT happen)
-4. A trace of what actually happened (HTTP responses, screenshots, logs)
+You are a QA judge evaluating whether a web application satisfies user-facing
+scenarios. You are **skeptical by default** — your job is to look for problems,
+not to rubber-stamp success.
 
-Your job: evaluate the trace against the criteria and produce a verdict.
+## Your Role
 
-RULES:
-- Judge the BEHAVIOR, not the code. You never see source code.
-- A "satisfied" verdict means a reasonable user would consider this working.
-- Be skeptical of traces that look suspiciously perfect — all 200s with
-  empty bodies likely means stub responses, not real functionality.
-- If the trace is insufficient to judge (missing steps, truncated logs),
-  verdict is "insufficient_evidence", not "satisfied".
-- When in doubt, rule "unsatisfied". False positives are worse than
-  false negatives in a validation harness.
+You judge **behavior, not code**. You are given:
+1. A scenario describing what the user should experience
+2. Evidence (screenshots, trace summaries, action logs) of what actually happened
+
+You must determine whether the scenario's satisfaction criteria were met based
+solely on the provided evidence.
+
+## Rules
+
+1. **Insufficient evidence is a valid verdict.** If the trace does not contain
+   enough information to confirm or deny a criterion, mark it as `null`
+   (insufficient evidence) rather than guessing.
+
+2. **Anti-patterns are automatic failures.** If you detect any listed
+   anti-pattern, the criterion it relates to is NOT met, regardless of other
+   evidence.
+
+3. **Numbers and metrics come from evidence reports only.** Do not invent
+   statistics, counts, or measurements.
+
+4. **Be specific in evidence citations.** Reference concrete observations:
+   "Frame 3 shows a blank sidebar" not "the sidebar appeared to have issues."
+
+5. **Partial satisfaction is unsatisfied.** If 4 of 5 criteria are met but 1
+   is not, the verdict is "unsatisfied" — but the satisfaction_score should
+   reflect the partial success (e.g., 0.8).
+
+6. **Score interpretation:**
+   - 1.0 = all criteria met, no anti-patterns, high confidence
+   - 0.7-0.9 = most criteria met, minor issues
+   - 0.4-0.6 = mixed results, significant gaps
+   - 0.1-0.3 = mostly failing, few criteria met
+   - 0.0 = complete failure or no usable evidence
+
+7. **Default to unsatisfied.** When evidence is ambiguous, lean toward
+   "unsatisfied" rather than "satisfied." The burden of proof is on the
+   application.
+
+## Output Format
+
+You MUST respond with ONLY a single valid JSON object. No prose, no markdown
+fences, no explanation outside the JSON.
 ```
 
-### The Judgment Schema: `harness/judgment-schema.json`
+### The Judgment Schema: `judgment-schema.json`
 
 ```json
 {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
+  "required": ["scenario_id", "verdict", "satisfaction_score",
+               "criteria_results", "anti_patterns_detected", "notes"],
+  "additionalProperties": false,
   "properties": {
-    "scenario_id": { "type": "string" },
+    "scenario_id": {
+      "type": "string",
+      "description": "The unique identifier for the scenario being judged"
+    },
     "verdict": {
       "type": "string",
       "enum": ["satisfied", "unsatisfied", "insufficient_evidence"]
     },
     "satisfaction_score": {
       "type": "number",
-      "minimum": 0.0,
-      "maximum": 1.0
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Confidence-weighted satisfaction score from 0 to 1"
     },
     "criteria_results": {
       "type": "array",
       "items": {
         "type": "object",
+        "required": ["criterion", "met", "evidence"],
+        "additionalProperties": false,
         "properties": {
           "criterion": { "type": "string" },
-          "met": { "type": "boolean" },
-          "evidence": { "type": "string" }
-        },
-        "required": ["criterion", "met", "evidence"]
+          "met": {
+            "type": ["boolean", "null"],
+            "description": "Whether met. null if insufficient evidence."
+          },
+          "evidence": {
+            "type": "string",
+            "description": "Specific evidence from the trace"
+          }
+        }
       }
     },
     "anti_patterns_detected": {
@@ -540,15 +527,13 @@ RULES:
       "items": { "type": "string" }
     },
     "notes": { "type": "string" }
-  },
-  "required": [
-    "scenario_id", "verdict", "satisfaction_score",
-    "criteria_results", "anti_patterns_detected", "notes"
-  ]
+  }
 }
 ```
 
-### `harness/judge.sh` (single-scenario utility)
+**Key schema detail:** `met` is `["boolean", "null"]` — not just `boolean`. The judge can mark a criterion as `null` when evidence is insufficient, distinct from `false` (actively disproven). The schema uses `additionalProperties: false` to prevent the judge from adding unrecognized fields.
+
+### `judge.sh` (single-scenario utility)
 
 Useful for re-judging a single scenario or debugging judge behavior:
 
@@ -556,146 +541,112 @@ Useful for re-judging a single scenario or debugging judge behavior:
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: bash harness/judge.sh <scenario.md> <trace_dir/scenario_id> <judgment_dir>
+# Usage: bash judge.sh <scenario-id> [trace-dir]
+SCENARIO_ID="${1:?Usage: judge.sh <scenario-id> [trace-dir]}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCENARIO_FILE="${SCRIPT_DIR}/scenarios/${SCENARIO_ID}.md"
 
-SCENARIO_FILE="$1"
-SCENARIO_TRACE_DIR="$2"
-JUDGMENT_DIR="$3"
+# Find the latest trace (or use provided trace-dir)
+if [ -n "${2:-}" ]; then
+  TRACE_DIR="$2"
+else
+  TRACES_BASE="${SCRIPT_DIR}/traces/${SCENARIO_ID}"
+  TRACE_DIR="$(ls -1d "${TRACES_BASE}"/*/ 2>/dev/null | sort | tail -1)"
+  TRACE_DIR="${TRACE_DIR%/}"
+fi
 
-HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
-SCENARIO_ID=$(grep '^id:' "$SCENARIO_FILE" | cut -d' ' -f2)
-mkdir -p "$JUDGMENT_DIR"
+# Assemble judge input — full scenario + full trace
+SCENARIO_CONTENT="$(cat "${SCENARIO_FILE}")"
+TRACE_CONTENT="$(cat "${TRACE_DIR}/trace-summary.md")"
 
-JUDGMENT_FILE="$JUDGMENT_DIR/${SCENARIO_ID}.judgment.json"
+JUDGE_INPUT="# Scenario Under Test
 
-# ── Extract scenario sections ───────────────────────────
-CRITERIA=$(sed -n '/## Satisfaction Criteria/,/## Anti-patterns/p' "$SCENARIO_FILE" | head -n -1)
-ANTIPATTERNS=$(sed -n '/## Anti-patterns/,/^$/p' "$SCENARIO_FILE")
-CONTEXT=$(sed -n '/## Context/,/## Steps/p' "$SCENARIO_FILE" | head -n -1)
+${SCENARIO_CONTENT}
 
-# ── Assemble evidence from trace directory ──────────────
-TRACE_SUMMARY=""
-[ -f "$SCENARIO_TRACE_DIR/trace-summary.md" ] && \
-  TRACE_SUMMARY=$(cat "$SCENARIO_TRACE_DIR/trace-summary.md")
+# Evidence Report (Trace Summary)
 
-MANIFEST=""
-[ -f "$SCENARIO_TRACE_DIR/manifest.json" ] && \
-  MANIFEST=$(cat "$SCENARIO_TRACE_DIR/manifest.json")
+${TRACE_CONTENT}
 
-CONSOLE=""
-[ -f "$SCENARIO_TRACE_DIR/console.log" ] && \
-  CONSOLE=$(tail -100 "$SCENARIO_TRACE_DIR/console.log")
+# Your Task
 
-USER_PROMPT="## Scenario: ${SCENARIO_ID}
+Evaluate the trace evidence against each satisfaction criterion listed in the
+scenario. Check for any anti-patterns.
 
-## Context
-${CONTEXT}
+IMPORTANT: Your entire response must be a single valid JSON object — no prose,
+no markdown, no explanation. Output ONLY the JSON object."
 
-## Satisfaction Criteria
-${CRITERIA}
+# Judge with self-correction retry loop
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+JUDGMENT_DIR="${SCRIPT_DIR}/judgments/${TIMESTAMP}"
+mkdir -p "${JUDGMENT_DIR}"
 
-## Anti-patterns
-${ANTIPATTERNS}
+RAW_OUTPUT="${JUDGMENT_DIR}/${SCENARIO_ID}.raw.json"
+CLEAN_OUTPUT="${JUDGMENT_DIR}/${SCENARIO_ID}.json"
+MAX_RETRIES=2
+CURRENT_PROMPT="${JUDGE_INPUT}"
 
-## Capture Agent's Narrative
-${TRACE_SUMMARY}
+for ATTEMPT in $(seq 0 "${MAX_RETRIES}"); do
+  # Run from /tmp to prevent Claude from reading CLAUDE.md (anti-contamination)
+  (cd /tmp && claude -p "${CURRENT_PROMPT}" \
+    --output-format stream-json --verbose \
+    --system-prompt-file "${SCRIPT_DIR}/judge-prompt.md" \
+    --json-schema "$(cat "${SCRIPT_DIR}/judgment-schema.json")" \
+    --allowedTools "") \
+    | python3 "${SCRIPT_DIR}/stream-filter.py" "${RAW_OUTPUT}"
 
-## Structured Trace (manifest)
-\`\`\`json
-${MANIFEST}
-\`\`\`
+  # Extract and validate the judgment JSON
+  EXTRACT_RESULT=$(python3 "${SCRIPT_DIR}/extract-judgment.py" \
+    "${RAW_OUTPUT}" "${CLEAN_OUTPUT}" 2>&1)
 
-## Console Output
-\`\`\`
-${CONSOLE}
-\`\`\`
+  if [ $? -eq 0 ]; then break; fi
 
-Evaluate this evidence and produce your judgment."
+  if [ "${ATTEMPT}" -lt "${MAX_RETRIES}" ]; then
+    # Feed the validation error back to Claude for self-correction
+    INVALID_JSON=""
+    [ -f "${CLEAN_OUTPUT}.invalid.json" ] && \
+      INVALID_JSON="$(cat "${CLEAN_OUTPUT}.invalid.json")"
 
-# ── Call Claude Code as judge ───────────────────────────
-# Key flags:
-#   -p                    → headless / non-interactive mode
-#   --system-prompt-file  → full prompt replacement (no default CC instructions)
-#   --output-format json  → machine-parseable with metadata
-#   --json-schema         → enforce verdict structure
-#   --allowedTools ""     → no tools — pure reasoning, no file access
-#   --no-user-prompt      → don't ask for confirmation (CI-safe)
+    CURRENT_PROMPT="Your previous JSON output failed schema validation.
 
-RESPONSE=$(echo "$USER_PROMPT" | claude -p \
-  --system-prompt-file "$HARNESS_DIR/judge-prompt.md" \
-  --output-format json \
-  --json-schema "$(cat "$HARNESS_DIR/judgment-schema.json")" \
-  --allowedTools "" \
-  2>"$JUDGMENT_DIR/${SCENARIO_ID}.judge.stderr" \
-)
+ERROR: ${EXTRACT_RESULT}
 
-# ── Extract the structured verdict ──────────────────────
-# With --output-format json, Claude Code returns:
-# {
-#   "type": "result",
-#   "result": "...",           ← text result
-#   "structured_output": {},   ← our schema-enforced JSON (when --json-schema used)
-#   "session_id": "...",
-#   "total_cost_usd": 0.003,
-#   "duration_ms": 1234
-# }
+Your previous output:
+${INVALID_JSON}
 
-# Pull the structured judgment and enrich with run metadata
-echo "$RESPONSE" | jq '{
-  judgment: .structured_output,
-  meta: {
-    session_id: .session_id,
-    cost_usd: .total_cost_usd,
-    duration_ms: .duration_ms,
-    is_error: .is_error
-  }
-}' > "$JUDGMENT_FILE"
+The JSON schema requires:
+$(cat "${SCRIPT_DIR}/judgment-schema.json")
 
-# Quick sanity check
-VERDICT=$(jq -r '.judgment.verdict' "$JUDGMENT_FILE" 2>/dev/null || echo "error")
-SCORE=$(jq -r '.judgment.satisfaction_score' "$JUDGMENT_FILE" 2>/dev/null || echo "0")
-
-echo "  → ${SCENARIO_ID}: ${VERDICT} (score: ${SCORE})"
-echo "    Judgment: $JUDGMENT_FILE"
+Fix the JSON to pass validation. Output ONLY the corrected JSON object."
+  else
+    echo "ERROR: Failed after $((MAX_RETRIES + 1)) attempts"
+    exit 1
+  fi
+done
 ```
 
-### Alternative: Stream-JSON for Real-Time Feedback
+**Key implementation details:**
 
-For long-running scenarios where you want to watch the judge think:
+- **The prompt passes the full scenario markdown** (frontmatter + description + steps + criteria + anti-patterns) as a single block, not extracted sections. The judge sees everything the scenario author wrote.
+- **Self-correction retry loop:** If the judge's JSON output fails schema validation, the error is fed back as a new prompt (up to 2 retries). This catches common issues like the judge wrapping JSON in markdown fences or using a `criteria` object instead of `criteria_results` array.
+- **`extract-judgment.py`** handles the envelope extraction, normalizes schema variants (e.g., `criteria` dict → `criteria_results` array, anti-pattern objects → strings), and validates against `judgment-schema.json` using the `jsonschema` Python package.
+- **`stream-filter.py`** displays the judge's reasoning on the terminal in real-time (dimmed text + highlighted tool calls) while capturing the final result JSON to disk. This is valuable for understanding *why* the judge ruled the way it did.
+
+### Real-Time Streaming with `stream-filter.py`
+
+Both judge and capture scripts use `--output-format stream-json --verbose` piped through `stream-filter.py` to show real-time output. This is the default mode, not an alternative — you always see the agent/judge thinking.
 
 ```bash
-echo "$USER_PROMPT" | claude -p \
-  --system-prompt-file "$HARNESS_DIR/judge-prompt.md" \
-  --output-format stream-json \
-  --verbose \
-  --include-partial-messages \
-  --allowedTools "" \
-  | tee "$JUDGMENT_DIR/${SCENARIO_ID}.stream.jsonl" \
-  | jq -rj 'select(.type == "stream_event" and .event.delta.type? == "text_delta") | .event.delta.text'
+# stream-filter.py reads newline-delimited JSON from stdin,
+# prints assistant text to stderr (dimmed), tool calls (cyan),
+# and writes the final result JSON to the output file.
+
+(cd /tmp && claude -p "${PROMPT}" \
+  --output-format stream-json --verbose \
+  --allowedTools "") \
+  | python3 stream-filter.py "${OUTPUT_FILE}"
 ```
 
-This streams the judge's reasoning token-by-token to your terminal while capturing the full JSONL stream to disk. Useful during development to see *why* the judge ruled the way it did.
-
-### Multi-Turn Judgment Sessions
-
-For complex scenarios where the judge might need to ask for clarification or see additional evidence, use session persistence:
-
-```bash
-# Initial judgment pass
-RESULT=$(echo "$USER_PROMPT" | claude -p \
-  --system-prompt-file "$HARNESS_DIR/judge-prompt.md" \
-  --output-format json \
-  --allowedTools "")
-
-SESSION_ID=$(echo "$RESULT" | jq -r '.session_id')
-
-# Follow-up: provide additional logs the judge flagged as missing
-claude -p --resume "$SESSION_ID" \
-  "Here are the server-side logs you requested:
-$(cat "$TRACE_DIR/${SCENARIO_ID}.server.log")" \
-  --output-format json \
-  --json-schema "$(cat "$HARNESS_DIR/judgment-schema.json")"
-```
+The final `result` event from the stream is saved as the raw JSON file, which `extract-judgment.py` then processes for the judge pipeline.
 
 ### Judge Design Principles
 
@@ -705,13 +656,13 @@ $(cat "$TRACE_DIR/${SCENARIO_ID}.server.log")" \
 
 **Use `--json-schema` for structured verdicts.** This isn't just convenience — it's structural enforcement. The judge *cannot* return a freeform essay instead of a verdict. The schema guarantees you get parseable output every time, or a clear error.
 
+**Build self-correction into the pipeline.** Even with `--json-schema`, the judge sometimes produces output that fails validation (wrong field names, objects where arrays are expected). The retry loop feeds validation errors back to Claude for self-correction — up to 2 retries. This is cheaper and more reliable than asking for perfect output on the first try. `extract-judgment.py` normalizes common variants (e.g., `criteria` dict → `criteria_results` array) before validation, reducing the need for retries.
+
 **Make the judge skeptical by default.** The system prompt should instruct the judge to look for signs of faking — empty response bodies, hardcoded values, stub implementations. A trace full of `200 OK` with no meaningful data is suspicious, not passing.
 
 **Include anti-patterns in the prompt.** Telling the judge what failure looks like is as important as telling it what success looks like. This catches subtle failures that pure criteria miss.
 
 **Score continuously, not just pass/fail.** A 0.0–1.0 satisfaction score gives you gradient information. A scenario scoring 0.7 across runs is more useful than a binary flip.
-
-**Capture cost and session metadata.** The `--output-format json` response includes `total_cost_usd` and `duration_ms`. Log these — they're your observability into the judge itself. If judge costs spike, your scenarios or traces might be bloating.
 
 ---
 
@@ -719,383 +670,178 @@ $(cat "$TRACE_DIR/${SCENARIO_ID}.server.log")" \
 
 The orchestrator runs the two phases in sequence: capture all traces, then judge all traces.
 
-### `harness/run.sh`
+### `run.sh`
+
+The orchestrator judges all scenarios that have traces and produces a report. Traces must already exist from a prior capture run.
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
-HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
-TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%S")
-TRACE_DIR="$HARNESS_DIR/traces/$TIMESTAMP"
-JUDGMENT_DIR="$HARNESS_DIR/judgments/$TIMESTAMP"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCENARIOS_DIR="${SCRIPT_DIR}/scenarios"
+TRACES_DIR="${SCRIPT_DIR}/traces"
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+JUDGMENT_DIR="${SCRIPT_DIR}/judgments/${TIMESTAMP}"
+mkdir -p "${JUDGMENT_DIR}"
 
-mkdir -p "$TRACE_DIR" "$JUDGMENT_DIR"
+SATISFIED=0; UNSATISFIED=0; INSUFFICIENT=0; TOTAL=0
+CRITICAL_FAILURES=()
 
-echo "═══════════════════════════════════════════"
-echo "  Satisfaction Harness Run: $TIMESTAMP"
-echo "═══════════════════════════════════════════"
+for SCENARIO_FILE in "${SCENARIOS_DIR}"/*.md; do
+  SCENARIO_ID="$(basename "${SCENARIO_FILE}" .md)"
+  TRACES_BASE="${TRACES_DIR}/${SCENARIO_ID}"
+  PRIORITY=$(sed -n 's/^priority: *//p' "${SCENARIO_FILE}" | tr -d '[:space:]')
 
-# ── Phase 1: Capture ────────────────────────────────────
-# Traces must already exist. Use one of:
-#   Mode A: bash capture-manual.sh recording.mp4 scenario-id
-#   Mode B: bash capture-agent.sh all 3
-#
-# Or set TRACE_DIR to point at pre-existing traces.
+  # Find the latest trace for this scenario
+  if [ ! -d "${TRACES_BASE}" ]; then
+    INSUFFICIENT=$((INSUFFICIENT + 1)); TOTAL=$((TOTAL + 1))
+    continue
+  fi
+  TRACE_DIR="$(ls -1d "${TRACES_BASE}"/*/ 2>/dev/null | sort | tail -1)"
+  TRACE_DIR="${TRACE_DIR%/}"
 
-TRACE_DIR="${TRACE_DIR_OVERRIDE:-$(ls -td "$HARNESS_DIR"/traces/*/ 2>/dev/null | head -1)}"
-
-if [ -z "$TRACE_DIR" ] || [ ! -d "$TRACE_DIR" ]; then
-  echo "✘ No traces found."
-  echo "  Run capture first:"
-  echo "    Mode A: bash capture-manual.sh <recording> <scenario_id>"
-  echo "    Mode B: bash capture-agent.sh all [num_runs]"
-  exit 1
-fi
-
-echo ""
-echo "── Phase 1: Using traces from ──"
-echo "  $TRACE_DIR"
-
-# ── Phase 2: Judge ──────────────────────────────────────
-# Separate Claude Code invocation per scenario.
-# Each judge call gets: scenario criteria + that scenario's trace artifacts.
-# Judge has NO tools — pure reasoning from the evidence.
-
-echo ""
-echo "── Phase 2: Judge ──"
-
-TOTAL=0
-SATISFIED=0
-UNSATISFIED=0
-INSUFFICIENT=0
-RESULTS="[]"
-
-for scenario in "$HARNESS_DIR"/scenarios/*.md; do
-  SCENARIO_ID=$(grep '^id:' "$scenario" | cut -d' ' -f2)
-  PRIORITY=$(grep '^priority:' "$scenario" | cut -d' ' -f2 || echo "normal")
-  SCENARIO_TRACE_DIR="$TRACE_DIR/$SCENARIO_ID"
-
-  echo ""
-  echo "  ── Judging: $SCENARIO_ID ($PRIORITY) ──"
-
-  # Skip if capture didn't produce a trace for this scenario
-  if [ ! -d "$SCENARIO_TRACE_DIR" ]; then
-    echo "     ⚠ No trace directory — capture may have failed"
+  if [ ! -f "${TRACE_DIR}/trace-summary.md" ]; then
+    INSUFFICIENT=$((INSUFFICIENT + 1)); TOTAL=$((TOTAL + 1))
     continue
   fi
 
-  # ── Assemble evidence for the judge ───────────────────
-  # The judge gets: scenario text + trace-summary.md + manifest.json
-  # For vision-capable judgment, screenshots could be included too.
+  # Assemble judge input — full scenario + full trace
+  SCENARIO_CONTENT="$(cat "${SCENARIO_FILE}")"
+  TRACE_CONTENT="$(cat "${TRACE_DIR}/trace-summary.md")"
 
-  CRITERIA=$(sed -n '/## Satisfaction Criteria/,/## Anti-patterns/p' "$scenario" | head -n -1)
-  ANTIPATTERNS=$(sed -n '/## Anti-patterns/,/^$/p' "$scenario")
-  CONTEXT=$(sed -n '/## Context/,/## Steps/p' "$scenario" | head -n -1)
+  JUDGE_INPUT="# Scenario Under Test
 
-  # Read the agent's narrative trace
-  TRACE_SUMMARY=""
-  if [ -f "$SCENARIO_TRACE_DIR/trace-summary.md" ]; then
-    TRACE_SUMMARY=$(cat "$SCENARIO_TRACE_DIR/trace-summary.md")
+${SCENARIO_CONTENT}
+
+# Evidence Report (Trace Summary)
+
+${TRACE_CONTENT}
+
+# Your Task
+
+Evaluate the trace evidence against each satisfaction criterion listed in the
+scenario. Check for any anti-patterns.
+
+IMPORTANT: Your entire response must be a single valid JSON object."
+
+  # Judge with self-correction retry loop (same as judge.sh)
+  RAW_OUTPUT="${JUDGMENT_DIR}/${SCENARIO_ID}.raw.json"
+  CLEAN_OUTPUT="${JUDGMENT_DIR}/${SCENARIO_ID}.json"
+  MAX_RETRIES=2
+  CURRENT_PROMPT="${JUDGE_INPUT}"
+  JUDGE_OK=false
+
+  for ATTEMPT in $(seq 0 "${MAX_RETRIES}"); do
+    (cd /tmp && claude -p "${CURRENT_PROMPT}" \
+      --output-format stream-json --verbose \
+      --system-prompt-file "${SCRIPT_DIR}/judge-prompt.md" \
+      --json-schema "$(cat "${SCRIPT_DIR}/judgment-schema.json")" \
+      --allowedTools "") \
+      | python3 "${SCRIPT_DIR}/stream-filter.py" "${RAW_OUTPUT}"
+
+    EXTRACT_RESULT=$(python3 "${SCRIPT_DIR}/extract-judgment.py" \
+      "${RAW_OUTPUT}" "${CLEAN_OUTPUT}" 2>&1)
+    if [ $? -eq 0 ]; then JUDGE_OK=true; break; fi
+
+    if [ "${ATTEMPT}" -lt "${MAX_RETRIES}" ]; then
+      # Feed validation error back to Claude for self-correction
+      INVALID_JSON=""
+      [ -f "${CLEAN_OUTPUT}.invalid.json" ] && \
+        INVALID_JSON="$(cat "${CLEAN_OUTPUT}.invalid.json")"
+      CURRENT_PROMPT="Your previous JSON output failed schema validation.
+ERROR: ${EXTRACT_RESULT}
+Your previous output: ${INVALID_JSON}
+Fix the JSON to pass validation. Output ONLY the corrected JSON object."
+    fi
+  done
+
+  # Tally results
+  if [ "${JUDGE_OK}" = "true" ]; then
+    VERDICT=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['verdict'])" "${CLEAN_OUTPUT}")
+    case "${VERDICT}" in
+      satisfied)    SATISFIED=$((SATISFIED + 1)) ;;
+      unsatisfied)
+        UNSATISFIED=$((UNSATISFIED + 1))
+        if [ "${PRIORITY}" = "critical" ]; then
+          CRITICAL_FAILURES+=("${SCENARIO_ID}")
+        fi
+        # Append failed criteria to failures.jsonl
+        python3 -c "
+import json, sys
+j = json.load(open(sys.argv[1]))
+for c in j['criteria_results']:
+    if c.get('met') is not True:
+        print(json.dumps({
+            'scenario_id': j['scenario_id'], 'criterion': c['criterion'],
+            'met': c['met'], 'evidence': c['evidence'],
+            'anti_patterns': j.get('anti_patterns_detected', []),
+            'satisfaction_score': j['satisfaction_score'],
+            'priority': sys.argv[2], 'notes': j.get('notes', '')
+        }))
+" "${CLEAN_OUTPUT}" "${PRIORITY:-normal}" >> "${JUDGMENT_DIR}/failures.jsonl"
+        ;;
+      *) INSUFFICIENT=$((INSUFFICIENT + 1)) ;;
+    esac
+  else
+    INSUFFICIENT=$((INSUFFICIENT + 1))
   fi
-
-  # Read the structured manifest
-  MANIFEST=""
-  if [ -f "$SCENARIO_TRACE_DIR/manifest.json" ]; then
-    MANIFEST=$(cat "$SCENARIO_TRACE_DIR/manifest.json")
-  fi
-
-  # Read console output
-  CONSOLE=""
-  if [ -f "$SCENARIO_TRACE_DIR/console.log" ]; then
-    CONSOLE=$(tail -100 "$SCENARIO_TRACE_DIR/console.log")
-  fi
-
-  USER_PROMPT="## Scenario: ${SCENARIO_ID}
-
-## Context
-${CONTEXT}
-
-## Satisfaction Criteria
-${CRITERIA}
-
-## Anti-patterns
-${ANTIPATTERNS}
-
-## Capture Agent's Narrative
-${TRACE_SUMMARY}
-
-## Structured Trace (manifest)
-\`\`\`json
-${MANIFEST}
-\`\`\`
-
-## Console Output
-\`\`\`
-${CONSOLE}
-\`\`\`
-
-Evaluate this evidence and produce your judgment."
-
-  # ── Call the judge ────────────────────────────────────
-  RESPONSE=$(echo "$USER_PROMPT" | claude -p \
-    --system-prompt-file "$HARNESS_DIR/judge-prompt.md" \
-    --output-format json \
-    --json-schema "$(cat "$HARNESS_DIR/judgment-schema.json")" \
-    --allowedTools "" \
-    2>"$JUDGMENT_DIR/${SCENARIO_ID}.judge.stderr" \
-  )
-
-  # Write judgment with metadata
-  JUDGMENT_FILE="$JUDGMENT_DIR/${SCENARIO_ID}.judgment.json"
-  echo "$RESPONSE" | jq '{
-    judgment: .structured_output,
-    meta: {
-      session_id: .session_id,
-      cost_usd: .total_cost_usd,
-      duration_ms: .duration_ms,
-      is_error: .is_error
-    }
-  }' > "$JUDGMENT_FILE"
-
-  VERDICT=$(jq -r '.judgment.verdict' "$JUDGMENT_FILE" 2>/dev/null || echo "error")
-  SCORE=$(jq -r '.judgment.satisfaction_score' "$JUDGMENT_FILE" 2>/dev/null || echo "0")
-  COST=$(jq -r '.meta.cost_usd // 0' "$JUDGMENT_FILE" 2>/dev/null || echo "0")
-
-  echo "     Verdict: $VERDICT (score: $SCORE, cost: \$${COST})"
-
-  ((TOTAL++))
-  case "$VERDICT" in
-    satisfied)      ((SATISFIED++)) ;;
-    unsatisfied)    ((UNSATISFIED++)) ;;
-    *)              ((INSUFFICIENT++)) ;;
-  esac
-
-  RESULTS=$(echo "$RESULTS" | jq \
-    --arg id "$SCENARIO_ID" \
-    --arg verdict "$VERDICT" \
-    --arg score "$SCORE" \
-    --arg priority "$PRIORITY" \
-    '. + [{"id":$id,"verdict":$verdict,"score":($score|tonumber),"priority":$priority}]')
+  TOTAL=$((TOTAL + 1))
 done
 
 # ── Report ──────────────────────────────────────────────
-echo ""
-echo "═══════════════════════════════════════════"
-echo "  SATISFACTION REPORT"
-echo "═══════════════════════════════════════════"
+PASS=$([ ${UNSATISFIED} -eq 0 ] && [ ${#CRITICAL_FAILURES[@]} -eq 0 ] && echo "true" || echo "false")
 
-SATISFACTION_RATE=$(echo "scale=2; $SATISFIED / $TOTAL * 100" | bc 2>/dev/null || echo "0")
+# Write report.json
+python3 -c "
+import json, sys
+print(json.dumps({
+    'timestamp': sys.argv[1], 'total': int(sys.argv[2]),
+    'satisfied': int(sys.argv[3]), 'unsatisfied': int(sys.argv[4]),
+    'insufficient_evidence': int(sys.argv[5]),
+    'critical_failures': sys.argv[6].split(',') if sys.argv[6] else [],
+    'pass': sys.argv[7] == 'true'
+}, indent=2))
+" "${TIMESTAMP}" "${TOTAL}" "${SATISFIED}" "${UNSATISFIED}" "${INSUFFICIENT}" \
+  "$(IFS=,; echo "${CRITICAL_FAILURES[*]:-}")" "${PASS}" \
+  > "${JUDGMENT_DIR}/report.json"
 
-echo "  Total scenarios:   $TOTAL"
-echo "  Satisfied:         $SATISFIED"
-echo "  Unsatisfied:       $UNSATISFIED"
-echo "  Insufficient:      $INSUFFICIENT"
-echo "  Satisfaction rate:  ${SATISFACTION_RATE}%"
-echo ""
-
-# Check for critical failures
-CRITICAL_FAILURES=$(echo "$RESULTS" | jq '[.[] | select(.priority=="critical" and .verdict!="satisfied")] | length')
-if [ "$CRITICAL_FAILURES" -gt 0 ]; then
-  echo "  ✘ CRITICAL FAILURES DETECTED"
-  echo "$RESULTS" | jq -r '.[] | select(.priority=="critical" and .verdict!="satisfied") | "    ✘ \(.id): \(.verdict)"'
-  echo ""
-  echo "  Build is NOT shippable."
-  exit 1
-fi
-
-# Write machine-readable report
-REPORT_FILE="$JUDGMENT_DIR/report.json"
-echo "$RESULTS" | jq \
-  --arg timestamp "$TIMESTAMP" \
-  --arg rate "$SATISFACTION_RATE" \
-  '{timestamp: $timestamp, satisfaction_rate: ($rate|tonumber), critical_failures: '"$CRITICAL_FAILURES"', scenarios: .}' \
-  > "$REPORT_FILE"
-
-echo ""
-echo "  Report: $REPORT_FILE"
-echo "═══════════════════════════════════════════"
+# Exit non-zero on critical failures
+if [ ${#CRITICAL_FAILURES[@]} -gt 0 ]; then exit 1; fi
 ```
+
+**Key differences from the single-scenario `judge.sh`:**
+
+- Iterates all scenarios, finds the latest trace for each
+- Produces `report.json` with aggregate tallies and `pass` boolean
+- Produces `failures.jsonl` — one JSON line per failed criterion across all scenarios, designed to be passed directly to coding agents for fixing
+- Exits non-zero if any scenario with `priority: critical` is unsatisfied
 
 ---
 
-## Component 5: Evidence Reports (Numbers Stay Deterministic)
+## Component 5: Failures Output (`failures.jsonl`)
 
-LLMs hallucinate numbers. If the capture phase records "P95 response time: 237ms" and the judge has to recall that number when writing its verdict, it might output "P95: 230ms" or "P95: 240ms." Close enough to seem right, wrong enough to mislead your decisions.
+When `run.sh` finds unsatisfied scenarios, it writes `failures.jsonl` to the judgment directory — one JSON line per failed criterion across all scenarios. This file is designed to be passed directly to coding agents for fixing.
 
-The fix is structural: **the capture phase generates a complete evidence report with all hard data pre-formatted, and the judge annotates it in place rather than restating it.**
-
-### The Evidence Report: `evidence-report.md`
-
-Before the judge runs, the orchestrator assembles a structured evidence report for each scenario. This report contains every number, metric, and factual observation from the capture phase — already written, already formatted. The judge's job is to add verdict annotations alongside the existing data, not to reproduce the data.
-
-```bash
-# ── Generate evidence report before judging ─────────────
-# This runs BEFORE the judge. All hard data lives in this file.
-# The judge reads it and adds assessment — never restates numbers.
-
-generate_evidence_report() {
-  local SCENARIO_ID="$1"
-  local SCENARIO_FILE="$2"
-  local SCENARIO_TRACE_DIR="$3"
-  local REPORT_FILE="$SCENARIO_TRACE_DIR/evidence-report.md"
-
-  # Start with scenario metadata
-  cat > "$REPORT_FILE" << HEADER
-# Evidence Report: ${SCENARIO_ID}
-Generated: $(date -u +"%Y-%m-%dT%H:%M:%S")
-
-## Scenario Criteria
-$(sed -n '/## Satisfaction Criteria/,/## Anti-patterns/p' "$SCENARIO_FILE" | head -n -1)
-
-## Anti-patterns
-$(sed -n '/## Anti-patterns/,/^$/p' "$SCENARIO_FILE")
-
-HEADER
-
-  # Append behavioral trace
-  if [ -f "$SCENARIO_TRACE_DIR/trace-summary.md" ]; then
-    echo "## Behavioral Trace" >> "$REPORT_FILE"
-    cat "$SCENARIO_TRACE_DIR/trace-summary.md" >> "$REPORT_FILE"
-    echo "" >> "$REPORT_FILE"
-  fi
-
-  # Append manifest data
-  if [ -f "$SCENARIO_TRACE_DIR/manifest.json" ]; then
-    echo "## Trace Metadata" >> "$REPORT_FILE"
-    echo '```json' >> "$REPORT_FILE"
-    cat "$SCENARIO_TRACE_DIR/manifest.json" >> "$REPORT_FILE"
-    echo '```' >> "$REPORT_FILE"
-    echo "" >> "$REPORT_FILE"
-  fi
-
-  # Append console output
-  if [ -f "$SCENARIO_TRACE_DIR/console.log" ]; then
-    ERRORS=$(grep -ci "error\|exception\|fatal" "$SCENARIO_TRACE_DIR/console.log" || echo "0")
-    WARNINGS=$(grep -ci "warn" "$SCENARIO_TRACE_DIR/console.log" || echo "0")
-    echo "## Console Output" >> "$REPORT_FILE"
-    echo "Error lines: ${ERRORS}" >> "$REPORT_FILE"
-    echo "Warning lines: ${WARNINGS}" >> "$REPORT_FILE"
-    echo '```' >> "$REPORT_FILE"
-    tail -100 "$SCENARIO_TRACE_DIR/console.log" >> "$REPORT_FILE"
-    echo '```' >> "$REPORT_FILE"
-    echo "" >> "$REPORT_FILE"
-  fi
-
-  # Append performance data (if adapter ran)
-  if [ -f "$SCENARIO_TRACE_DIR/perf-http.json" ]; then
-    echo "## Performance Metrics" >> "$REPORT_FILE"
-    echo "| Endpoint | Status | TTFB (ms) | Total (ms) | Size (bytes) |" >> "$REPORT_FILE"
-    echo "|----------|--------|-----------|------------|--------------|" >> "$REPORT_FILE"
-    jq -r '.[] | "| \(.url) | \(.http_code) | \(.time_ttfb * 1000 | floor) | \(.time_total * 1000 | floor) | \(.size_download) |"' \
-      "$SCENARIO_TRACE_DIR/perf-http.json" >> "$REPORT_FILE" 2>/dev/null
-    echo "" >> "$REPORT_FILE"
-
-    # Pre-compute aggregates so the judge doesn't have to
-    AVG_TTFB=$(jq '[.[].time_ttfb] | (add / length) * 1000 | floor' "$SCENARIO_TRACE_DIR/perf-http.json" 2>/dev/null || echo "N/A")
-    MAX_TTFB=$(jq '[.[].time_ttfb] | max * 1000 | floor' "$SCENARIO_TRACE_DIR/perf-http.json" 2>/dev/null || echo "N/A")
-    P95_TOTAL=$(jq '[.[].time_total] | sort | .[length * 0.95 | floor] * 1000 | floor' "$SCENARIO_TRACE_DIR/perf-http.json" 2>/dev/null || echo "N/A")
-
-    echo "**Aggregates (pre-computed, do not recalculate):**" >> "$REPORT_FILE"
-    echo "- Average TTFB: ${AVG_TTFB}ms" >> "$REPORT_FILE"
-    echo "- Max TTFB: ${MAX_TTFB}ms" >> "$REPORT_FILE"
-    echo "- P95 total response time: ${P95_TOTAL}ms" >> "$REPORT_FILE"
-    echo "" >> "$REPORT_FILE"
-  fi
-
-  if [ -f "$SCENARIO_TRACE_DIR/lighthouse.json" ]; then
-    PERF_SCORE=$(jq '.categories.performance.score * 100 | floor' "$SCENARIO_TRACE_DIR/lighthouse.json" 2>/dev/null || echo "N/A")
-    LCP=$(jq '.audits["largest-contentful-paint"].numericValue | floor' "$SCENARIO_TRACE_DIR/lighthouse.json" 2>/dev/null || echo "N/A")
-    TTI=$(jq '.audits["interactive"].numericValue | floor' "$SCENARIO_TRACE_DIR/lighthouse.json" 2>/dev/null || echo "N/A")
-    CLS=$(jq '.audits["cumulative-layout-shift"].numericValue' "$SCENARIO_TRACE_DIR/lighthouse.json" 2>/dev/null || echo "N/A")
-
-    echo "**Lighthouse (pre-computed, do not recalculate):**" >> "$REPORT_FILE"
-    echo "- Performance score: ${PERF_SCORE}/100" >> "$REPORT_FILE"
-    echo "- LCP: ${LCP}ms" >> "$REPORT_FILE"
-    echo "- TTI: ${TTI}ms" >> "$REPORT_FILE"
-    echo "- CLS: ${CLS}" >> "$REPORT_FILE"
-    echo "" >> "$REPORT_FILE"
-  fi
-
-  # Append security scan results (if adapter ran)
-  if [ -f "$SCENARIO_TRACE_DIR/security-manifest.json" ]; then
-    echo "## Security Scan Results" >> "$REPORT_FILE"
-    SECRETS=$(jq '.secrets_found' "$SCENARIO_TRACE_DIR/security-manifest.json" 2>/dev/null || echo "0")
-    echo "- Secrets detected: ${SECRETS}" >> "$REPORT_FILE"
-
-    if [ -f "$SCENARIO_TRACE_DIR/npm-audit.json" ]; then
-      CRIT=$(jq '.metadata.vulnerabilities.critical // 0' "$SCENARIO_TRACE_DIR/npm-audit.json" 2>/dev/null)
-      HIGH=$(jq '.metadata.vulnerabilities.high // 0' "$SCENARIO_TRACE_DIR/npm-audit.json" 2>/dev/null)
-      MED=$(jq '.metadata.vulnerabilities.moderate // 0' "$SCENARIO_TRACE_DIR/npm-audit.json" 2>/dev/null)
-      echo "- Dependency vulnerabilities: ${CRIT} critical, ${HIGH} high, ${MED} moderate" >> "$REPORT_FILE"
-    fi
-    echo "" >> "$REPORT_FILE"
-  fi
-
-  echo "$REPORT_FILE"
-}
+```json
+{"scenario_id": "character-story-creation", "criterion": "sidebar_shows_outline", "met": false, "evidence": "The sidebar area remained empty after clicking the Story Outline tab", "anti_patterns": ["Blank or empty content areas where text should appear"], "satisfaction_score": 0.6, "priority": "critical", "notes": "4 of 5 criteria met but sidebar content never loaded"}
 ```
 
-### Updated Judge Prompt
+Each line includes:
+- `scenario_id` — which scenario failed
+- `criterion` — which specific criterion failed (matches the bold ID in the scenario)
+- `met` — `false` or `null` (insufficient evidence)
+- `evidence` — the judge's specific citation from the trace
+- `anti_patterns` — any anti-patterns the judge detected
+- `satisfaction_score` — overall scenario score
+- `priority` — from scenario frontmatter
+- `notes` — judge's reasoning
 
-The judge prompt now explicitly tells the judge to reference numbers from the report, not generate its own:
+**Intentionally excludes `scenario_file`** to prevent coding agents from reading scenario definitions and gaming the tests.
 
-```markdown
-# Added to judge-prompt.md:
+### Evidence Reports (Future Adapter Pattern)
 
-CRITICAL RULE ABOUT NUMBERS AND METRICS:
-The evidence report contains pre-computed metrics (response times, scores,
-error counts, etc.). These numbers are AUTHORITATIVE.
-
-- NEVER recalculate, round, or approximate numbers from the report.
-- When citing a metric in your judgment, reference it exactly as it appears.
-- If a performance criterion says "under 200ms" and the report shows
-  "P95: 237ms", your criterion result should cite "P95: 237ms" — not
-  "approximately 240ms" or "about 237ms."
-- If you are unsure about a number, say "see evidence report" rather
-  than guessing.
-```
-
-### Updated Orchestrator Flow
-
-The orchestrator now generates the evidence report *before* calling the judge, and passes the report as the primary input:
-
-```bash
-  # ── Generate evidence report ─────────────────────────
-  EVIDENCE_REPORT=$(generate_evidence_report \
-    "$SCENARIO_ID" "$scenario" "$SCENARIO_TRACE_DIR")
-
-  # ── Call the judge with the report ───────────────────
-  # The judge reads the pre-assembled report, not raw artifacts
-  USER_PROMPT="$(cat "$EVIDENCE_REPORT")
-
----
-
-Evaluate the evidence above and produce your judgment.
-Reference all numbers exactly as they appear in the report."
-
-  RESPONSE=$(echo "$USER_PROMPT" | claude -p \
-    --system-prompt-file "$HARNESS_DIR/judge-prompt.md" \
-    --output-format json \
-    --json-schema "$(cat "$HARNESS_DIR/judgment-schema.json")" \
-    --allowedTools "" \
-    2>"$JUDGMENT_DIR/${SCENARIO_ID}.judge.stderr" \
-  )
-```
-
-### The Combined Output
-
-After the judge runs, you have two files per scenario:
-
-```
-judgments/<timestamp>/<scenario_id>/
-├── evidence-report.md       ← all hard data, pre-computed, authoritative
-└── judgment.json             ← judge's assessment referencing the report
-```
-
-When you review results, you can verify the judge's claims against the evidence report. If the judge says "P95 was within tolerance" and the evidence report shows P95: 237ms against a 200ms target, you see the discrepancy immediately. The evidence report is the source of truth; the judgment is the interpretation.
-
-This also makes the judgment files much more useful for feeding back to coding agents. Instead of "the judge said response times were slow," you can say "P95 is 237ms (see evidence-report.md line 47), target is 200ms, fix the bottleneck."
+When adapters (performance, code quality, security) are added, the capture phase should generate a structured evidence report with all hard data pre-formatted. The judge prompt should instruct the judge to reference numbers exactly as they appear in the report — never recalculate, round, or approximate. This prevents LLM number hallucination. Currently the core harness passes raw `trace-summary.md` to the judge, which works well for behavioral judgment where evidence is narrative rather than numeric.
 
 ---
 
@@ -1113,10 +859,14 @@ harness-repo/
 ├── judgment-schema.json     ← verdict structure
 ├── capture-manual.sh        ← Mode A
 ├── capture-agent.sh         ← Mode B
-└── run.sh                   ← orchestrator
+├── judge.sh                 ← single-scenario judge
+├── run.sh                   ← orchestrator (all scenarios)
+├── extract-judgment.py      ← JSON extraction + validation
+├── stream-filter.py         ← real-time stream display
+└── Makefile                 ← convenience targets
 ```
 
-Start with Mode A: record yourself running through the critical path, drop the video in, run the judge. Once it works, try Mode B with `bash capture-agent.sh smoke 3` to see if the agent can replicate your walkthrough. Expand scenarios as bugs surface.
+Start with Mode A: record yourself running through the critical path, drop the video in, run the judge. Once it works, try Mode B with `make capture SCENARIO=smoke RUNS=3` to see if the agent can replicate your walkthrough. Expand scenarios as bugs surface.
 
 ### Pattern 2: Vision-Enhanced Judgment
 
@@ -1153,69 +903,47 @@ Codex CLI's `codex exec` maps cleanly to Claude Code's `claude -p`:
 #!/usr/bin/env bash
 # judge-codex.sh
 # Judge a scenario using Codex CLI instead of Claude Code.
-# Usage: bash judge-codex.sh <scenario.md> <trace_dir/scenario_id> <judgment_dir>
+# Usage: bash judge-codex.sh <scenario-id> [trace-dir]
 set -euo pipefail
 
-SCENARIO_FILE="$1"
-SCENARIO_TRACE_DIR="$2"
-JUDGMENT_DIR="$3"
+SCENARIO_ID="${1:?Usage: judge-codex.sh <scenario-id> [trace-dir]}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCENARIO_FILE="${SCRIPT_DIR}/scenarios/${SCENARIO_ID}.md"
 
-HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
-SCENARIO_ID=$(grep '^id:' "$SCENARIO_FILE" | cut -d' ' -f2)
-mkdir -p "$JUDGMENT_DIR"
+# Find the latest trace (or use provided trace-dir)
+if [ -n "${2:-}" ]; then
+  TRACE_DIR="$2"
+else
+  TRACES_BASE="${SCRIPT_DIR}/traces/${SCENARIO_ID}"
+  TRACE_DIR="$(ls -1d "${TRACES_BASE}"/*/ 2>/dev/null | sort | tail -1)"
+  TRACE_DIR="${TRACE_DIR%/}"
+fi
 
-JUDGMENT_FILE="$JUDGMENT_DIR/${SCENARIO_ID}.judgment.json"
+JUDGMENT_DIR="${SCRIPT_DIR}/judgments/$(date +%Y%m%d-%H%M%S)"
+mkdir -p "${JUDGMENT_DIR}"
+JUDGMENT_FILE="${JUDGMENT_DIR}/${SCENARIO_ID}.json"
 
-# ── Assemble evidence (same as Claude judge) ────────────
-CRITERIA=$(sed -n '/## Satisfaction Criteria/,/## Anti-patterns/p' "$SCENARIO_FILE" | head -n -1)
-ANTIPATTERNS=$(sed -n '/## Anti-patterns/,/^$/p' "$SCENARIO_FILE")
-CONTEXT=$(sed -n '/## Context/,/## Steps/p' "$SCENARIO_FILE" | head -n -1)
+# Assemble evidence — same structure as Claude judge
+SCENARIO_CONTENT="$(cat "${SCENARIO_FILE}")"
+TRACE_CONTENT="$(cat "${TRACE_DIR}/trace-summary.md")"
+JUDGE_PROMPT="$(cat "${SCRIPT_DIR}/judge-prompt.md")"
 
-TRACE_SUMMARY=""
-[ -f "$SCENARIO_TRACE_DIR/trace-summary.md" ] && \
-  TRACE_SUMMARY=$(cat "$SCENARIO_TRACE_DIR/trace-summary.md")
-
-MANIFEST=""
-[ -f "$SCENARIO_TRACE_DIR/manifest.json" ] && \
-  MANIFEST=$(cat "$SCENARIO_TRACE_DIR/manifest.json")
-
-CONSOLE=""
-[ -f "$SCENARIO_TRACE_DIR/console.log" ] && \
-  CONSOLE=$(tail -100 "$SCENARIO_TRACE_DIR/console.log")
-
-# ── Read the judge prompt ───────────────────────────────
-JUDGE_PROMPT=$(cat "$HARNESS_DIR/judge-prompt.md")
-
-# ── Build the full prompt ───────────────────────────────
 FULL_PROMPT="${JUDGE_PROMPT}
 
 ---
 
-## Scenario: ${SCENARIO_ID}
+# Scenario Under Test
 
-## Context
-${CONTEXT}
+${SCENARIO_CONTENT}
 
-## Satisfaction Criteria
-${CRITERIA}
+# Evidence Report (Trace Summary)
 
-## Anti-patterns
-${ANTIPATTERNS}
+${TRACE_CONTENT}
 
-## Capture Agent's Narrative
-${TRACE_SUMMARY}
+# Your Task
 
-## Structured Trace (manifest)
-\`\`\`json
-${MANIFEST}
-\`\`\`
-
-## Console Output
-\`\`\`
-${CONSOLE}
-\`\`\`
-
-Evaluate this evidence and produce your judgment."
+Evaluate the trace evidence against each satisfaction criterion.
+Output ONLY a valid JSON object matching the judgment schema."
 
 # ── Call Codex as judge ─────────────────────────────────
 # Key flags:
@@ -1228,14 +956,14 @@ Evaluate this evidence and produce your judgment."
 
 echo "$FULL_PROMPT" | codex exec \
   -s read-only \
-  --output-schema "$HARNESS_DIR/judgment-schema.json" \
+  --output-schema "${SCRIPT_DIR}/judgment-schema.json" \
   --json \
   --ephemeral \
-  -o "$JUDGMENT_FILE" \
-  2>"$JUDGMENT_DIR/${SCENARIO_ID}.judge.stderr"
+  -o "${JUDGMENT_FILE}" \
+  2>"${JUDGMENT_DIR}/${SCENARIO_ID}.judge.stderr"
 
-VERDICT=$(jq -r '.verdict' "$JUDGMENT_FILE" 2>/dev/null || echo "error")
-SCORE=$(jq -r '.satisfaction_score' "$JUDGMENT_FILE" 2>/dev/null || echo "0")
+VERDICT=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['verdict'])" "${JUDGMENT_FILE}")
+SCORE=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['satisfaction_score'])" "${JUDGMENT_FILE}")
 
 echo "  → ${SCENARIO_ID}: ${VERDICT} (score: ${SCORE}) [codex]"
 ```
@@ -1831,16 +1559,20 @@ The uncomfortable truth: security in agentic development requires a human in the
 ## Quick-Start Checklist
 
 1. **Verify Claude Code CLI is installed and authed.** Run `claude -p "hello" --output-format json` — you should get a JSON response with a `result` field. If not, run `claude` interactively first to authenticate.
-2. **Create `harness/` directory** outside your source tree (or in a path your coding agent's `CLAUDE.md` says not to touch)
-3. **Write `harness/judge-prompt.md`** — your judge persona (use the template in this spec)
-4. **Write `harness/judgment-schema.json`** — your verdict structure (use the template in this spec)
-5. **Write 3–5 scenarios** covering the critical path, one edge case, and one adversarial case
-6. **Implement `capture.sh`** for your stack (curl for APIs, Playwright for UI)
-7. **Wire `judge.sh`** — the one-liner is `echo "$prompt" | claude -p --system-prompt-file harness/judge-prompt.md --output-format json --json-schema "$(cat harness/judgment-schema.json)" --allowedTools ""`
-8. **Wire `run.sh`** to run capture → judge → report for each scenario
-9. **Add to `CLAUDE.md`** so your coding agent knows to run `bash harness/run.sh` after changes
-10. **Run it once manually** to calibrate — are scenarios too strict? Too loose? Check judge costs with `jq '.meta.cost_usd' judgments/*/*.judgment.json`
-11. **Read the judgments** and manually feed failure descriptions to your coding agents as context
+2. **Install Python dependency:** `pip install jsonschema` (needed by `extract-judgment.py`)
+3. **Set up Playwright MCP:** `claude mcp add playwright -- npx -y @playwright/mcp@latest`
+4. **Create harness directory** outside your source tree (or in a path your coding agent's `CLAUDE.md` says not to touch)
+5. **Write `judge-prompt.md`** — your judge persona (use the template in this spec)
+6. **Write `judgment-schema.json`** — your verdict structure (use the template in this spec)
+7. **Write 3–5 scenarios** in `scenarios/` covering the critical path, one edge case, and one adversarial case
+8. **Run a capture:** `make capture SCENARIO=your-scenario` (Mode B) or `make capture-manual RECORDING=file.mp4 SCENARIO=your-scenario` (Mode A)
+9. **Judge it:** `make judge SCENARIO=your-scenario` (single) or `make run` (all scenarios)
+10. **Read the judgments** — check `judgments/<timestamp>/report.json` for the summary and `failures.jsonl` for agent-feedable failure details
+11. **Feed failures to coding agents** — pass `failures.jsonl` lines directly as context for agents to fix issues
+
+## Dependencies
+
+All scripts use `claude` CLI (Claude Code), `python3` (with `jsonschema` package), and `bash`. `capture-manual.sh` also needs `ffmpeg`. `capture-agent.sh` needs Playwright MCP configured. No `jq` dependency — all JSON processing uses `python3`.
 
 ---
 
