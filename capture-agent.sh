@@ -78,9 +78,23 @@ ${SCENARIO_CONTENT}
 Write your complete trace (all observations, screenshots taken, and summary) as a detailed markdown report. Be factual — describe what you literally see on screen."
 
     # Run from /tmp to prevent Claude from reading CLAUDE.md or repo files (anti-contamination)
+    # Stream assistant output to terminal via stream-filter, save final result for trace extraction
     if (cd /tmp && claude -p "${CAPTURE_PROMPT}" \
+      --output-format stream-json --verbose \
       --allowedTools "mcp__playwright__*") \
-      > "${TRACE_DIR}/trace-summary.md" 2>"${TRACE_DIR}/capture-stderr.log"; then
+      2>"${TRACE_DIR}/capture-stderr.log" \
+      | python3 "${SCRIPT_DIR}/stream-filter.py" "${TRACE_DIR}/trace-raw.json"; then
+      # Extract text result from the stream envelope
+      python3 -c "
+import json, sys
+data = json.load(open(sys.argv[1]))
+result = data.get('result', '')
+# structured_output takes priority if present
+so = data.get('structured_output')
+if isinstance(so, str):
+    result = so
+print(result)
+" "${TRACE_DIR}/trace-raw.json" > "${TRACE_DIR}/trace-summary.md"
 
       TRACE_SIZE=$(wc -c < "${TRACE_DIR}/trace-summary.md")
       TRACE_LINES=$(wc -l < "${TRACE_DIR}/trace-summary.md")

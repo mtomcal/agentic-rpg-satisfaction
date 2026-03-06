@@ -116,12 +116,13 @@ IMPORTANT: Your entire response must be a single valid JSON object — no prose,
     fi
 
     # Run from /tmp to prevent Claude from reading CLAUDE.md or repo files (anti-contamination)
+    # Stream judge reasoning to terminal in real-time
     (cd /tmp && claude -p "${CURRENT_PROMPT}" \
-      --output-format json \
+      --output-format stream-json --verbose \
       --system-prompt-file "${SCRIPT_DIR}/judge-prompt.md" \
       --json-schema "$(cat "${SCRIPT_DIR}/judgment-schema.json")" \
       --allowedTools "") \
-      > "${RAW_OUTPUT}"
+      | python3 "${SCRIPT_DIR}/stream-filter.py" "${RAW_OUTPUT}"
 
     EXTRACT_RESULT=$(python3 "${SCRIPT_DIR}/extract-judgment.py" "${RAW_OUTPUT}" "${CLEAN_OUTPUT}" 2>&1)
 
@@ -200,7 +201,6 @@ for c in d['criteria_results']:
       python3 -c "
 import json, sys
 judgment = json.load(open(sys.argv[1]))
-scenario_file = sys.argv[2]
 for c in judgment['criteria_results']:
     if c.get('met') is not True:
         line = {
@@ -210,12 +210,11 @@ for c in judgment['criteria_results']:
             'evidence': c['evidence'],
             'anti_patterns': judgment.get('anti_patterns_detected', []),
             'satisfaction_score': judgment['satisfaction_score'],
-            'priority': sys.argv[3],
-            'scenario_file': scenario_file,
+            'priority': sys.argv[2],
             'notes': judgment.get('notes', '')
         }
         print(json.dumps(line))
-" "${CLEAN_OUTPUT}" "${SCENARIO_FILE}" "${PRIORITY:-normal}" >> "${JUDGMENT_DIR}/failures.jsonl"
+" "${CLEAN_OUTPUT}" "${PRIORITY:-normal}" >> "${JUDGMENT_DIR}/failures.jsonl"
       ;;
     insufficient_evidence)
       INSUFFICIENT=$((INSUFFICIENT + 1))

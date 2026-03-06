@@ -56,7 +56,7 @@ Verdicts: `satisfied`, `unsatisfied`, `insufficient_evidence`. Score is 0–1. E
 
 ## Failures Output
 
-`run.sh` produces `judgments/<timestamp>/failures.jsonl` — one JSON line per failed criterion across all scenarios. Each line includes `scenario_id`, `criterion`, `evidence`, `anti_patterns`, `priority`, `scenario_file`, and `notes`. Designed to be passed directly to coding agents for fixing.
+`run.sh` produces `judgments/<timestamp>/failures.jsonl` — one JSON line per failed criterion across all scenarios. Each line includes `scenario_id`, `criterion`, `evidence`, `anti_patterns`, `priority`, and `notes`. Designed to be passed directly to coding agents for fixing. Intentionally excludes `scenario_file` to prevent agents from reading scenario definitions and gaming the tests.
 
 ## Adding a New Scenario
 
