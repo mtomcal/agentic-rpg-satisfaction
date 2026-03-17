@@ -25,18 +25,18 @@ echo ""
 
 # Count scenarios
 SCENARIO_COUNT=0
-for _ in "${SCENARIOS_DIR}"/*.md; do SCENARIO_COUNT=$((SCENARIO_COUNT + 1)); done
+for _ in "${SCENARIOS_DIR}"/*.criteria.md; do SCENARIO_COUNT=$((SCENARIO_COUNT + 1)); done
 echo "  Scenarios found: ${SCENARIO_COUNT}"
 echo "  Judgments dir:   ${JUDGMENT_DIR}"
 echo ""
 
 SCENARIO_NUM=0
 
-for SCENARIO_FILE in "${SCENARIOS_DIR}"/*.md; do
-  SCENARIO_ID="$(basename "${SCENARIO_FILE}" .md)"
+for CRITERIA_FILE in "${SCENARIOS_DIR}"/*.criteria.md; do
+  SCENARIO_ID="$(basename "${CRITERIA_FILE}" .criteria.md)"
   TRACES_BASE="${TRACES_DIR}/${SCENARIO_ID}"
   SCENARIO_NUM=$((SCENARIO_NUM + 1))
-  PRIORITY=$(sed -n 's/^priority: *//p' "${SCENARIO_FILE}" | tr -d '[:space:]')
+  PRIORITY=$(sed -n 's/^priority: *//p' "${CRITERIA_FILE}" | tr -d '[:space:]')
 
   echo "------------------------------------------"
   echo "  [${SCENARIO_NUM}/${SCENARIO_COUNT}] ${SCENARIO_ID}"
@@ -78,12 +78,12 @@ for SCENARIO_FILE in "${SCENARIOS_DIR}"/*.md; do
   # --- Judge ---
   echo "  Judging... (sending to Claude, no tools)"
 
-  SCENARIO_CONTENT="$(cat "${SCENARIO_FILE}")"
+  CRITERIA_CONTENT="$(cat "${CRITERIA_FILE}")"
   TRACE_CONTENT="$(cat "${TRACE_DIR}/trace-summary.md")"
 
-  JUDGE_INPUT="# Scenario Under Test
+  JUDGE_INPUT="# Judgment Criteria
 
-${SCENARIO_CONTENT}
+${CRITERIA_CONTENT}
 
 # Evidence Report (Trace Summary)
 
@@ -91,7 +91,7 @@ ${TRACE_CONTENT}
 
 # Your Task
 
-Evaluate the trace evidence against each satisfaction criterion listed in the scenario. Check for any anti-patterns.
+Evaluate the trace evidence against each satisfaction criterion. Check for any anti-patterns. The evidence was gathered by a separate observer — assess it on its own merits.
 
 IMPORTANT: Your entire response must be a single valid JSON object — no prose, no markdown, no explanation. Output ONLY the JSON object matching this schema:
 

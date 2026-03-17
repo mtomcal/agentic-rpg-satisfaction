@@ -14,25 +14,25 @@ echo "  CAPTURE MODE B — Agent (Playwright)"
 echo "  $(date)"
 echo "========================================"
 
-# Collect scenario files to process
+# Collect steps files to process
 if [ "${SCENARIO_ID}" = "all" ]; then
-  SCENARIO_FILES=("${SCENARIOS_DIR}"/*.md)
-  SCENARIO_COUNT=${#SCENARIO_FILES[@]}
+  STEPS_FILES=("${SCENARIOS_DIR}"/*.steps.md)
+  SCENARIO_COUNT=${#STEPS_FILES[@]}
   echo ""
   echo "  Mode:      all scenarios (${SCENARIO_COUNT} found)"
   echo "  Runs each: ${RUN_COUNT}"
 else
-  SCENARIO_FILE="${SCENARIOS_DIR}/${SCENARIO_ID}.md"
-  if [ ! -f "${SCENARIO_FILE}" ]; then
+  STEPS_FILE="${SCENARIOS_DIR}/${SCENARIO_ID}.steps.md"
+  if [ ! -f "${STEPS_FILE}" ]; then
     echo ""
-    echo "  ERROR: Scenario not found: ${SCENARIO_FILE}"
+    echo "  ERROR: Scenario not found: ${STEPS_FILE}"
     echo "  Available scenarios:"
-    for f in "${SCENARIOS_DIR}"/*.md; do
-      echo "    - $(basename "$f" .md)"
+    for f in "${SCENARIOS_DIR}"/*.steps.md; do
+      echo "    - $(basename "$f" .steps.md)"
     done
     exit 1
   fi
-  SCENARIO_FILES=("${SCENARIO_FILE}")
+  STEPS_FILES=("${STEPS_FILE}")
   echo ""
   echo "  Scenario:  ${SCENARIO_ID}"
   echo "  Runs:      ${RUN_COUNT}"
@@ -42,9 +42,9 @@ echo ""
 TOTAL_RUNS=0
 SUCCESSFUL_RUNS=0
 
-for SCENARIO_FILE in "${SCENARIO_FILES[@]}"; do
-  CURRENT_ID="$(basename "${SCENARIO_FILE}" .md)"
-  SCENARIO_CONTENT="$(cat "${SCENARIO_FILE}")"
+for STEPS_FILE in "${STEPS_FILES[@]}"; do
+  CURRENT_ID="$(basename "${STEPS_FILE}" .steps.md)"
+  STEPS_CONTENT="$(cat "${STEPS_FILE}")"
 
   for RUN in $(seq 1 "${RUN_COUNT}"); do
     TOTAL_RUNS=$((TOTAL_RUNS + 1))
@@ -62,20 +62,20 @@ for SCENARIO_FILE in "${SCENARIO_FILES[@]}"; do
     echo "         Driving browser at http://localhost:3000"
     echo "         This may take a few minutes..."
 
-    CAPTURE_PROMPT="You are a QA tester using a web browser via Playwright MCP tools. Your job is to execute the following test scenario and document everything you observe.
+    CAPTURE_PROMPT="You are a QA tester using a web browser via Playwright MCP tools. Your job is to execute the following test steps and document everything you observe.
 
-## Scenario
-${SCENARIO_CONTENT}
+## Steps
+${STEPS_CONTENT}
 
 ## Instructions
-1. Follow the steps described in the scenario exactly
+1. Follow the steps described above exactly
 2. After each step, take a screenshot and describe what you see
 3. Note any errors, unexpected behavior, or deviations from expected results
 4. If a step fails, still attempt remaining steps and document the failure
 5. At the end, write a complete trace summary
 
 ## Output
-Write your complete trace (all observations, screenshots taken, and summary) as a detailed markdown report. Be factual — describe what you literally see on screen."
+Write your complete trace (all observations, screenshots taken, and summary) as a detailed markdown report. Describe what you literally see on screen — do not judge whether criteria are met, just report factual observations."
 
     # Run from /tmp to prevent Claude from reading CLAUDE.md or repo files (anti-contamination)
     # Stream assistant output to terminal via stream-filter, save final result for trace extraction
