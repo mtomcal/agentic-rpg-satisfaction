@@ -75,9 +75,11 @@ The sweet spot is high-velocity development on a product where behavioral correc
 │         HARNESS REPO (separate, holdout)         │
 │                                                  │
 │  scenarios/            ← holdout scenario files  │
-│  │  ├── happy-path.md                            │
-│  │  ├── edge-error.md                            │
-│  │  └── adversarial.md                           │
+│  │  ├── happy-path.steps.md    (capture agent)   │
+│  │  ├── happy-path.criteria.md (judge only)      │
+│  │  ├── edge-error.steps.md                      │
+│  │  ├── edge-error.criteria.md                   │
+│  │  └── ...                                      │
 │  traces/               ← capture output          │
 │  │  └── <scenario_id>/<timestamp>/               │
 │  │      ├── trace-summary.md                     │
@@ -121,7 +123,7 @@ Makefile shortcuts:
   make clean
 ```
 
-**Key structural rule:** Scenarios live *outside* the codebase the agent edits. This is the holdout principle — the coding agent never sees the evaluation criteria, so it can't overfit to them.
+**Key structural rules:** Scenarios live *outside* the codebase the agent edits — the holdout principle. Additionally, each scenario is split into a steps file (for the capture agent) and a criteria file (for the judge). The capture agent never sees evaluation criteria, so it can't inject pass/fail opinions into the trace. The judge never sees the steps, so it evaluates evidence independently.
 
 ---
 
@@ -129,13 +131,16 @@ Makefile shortcuts:
 
 A scenario is a natural-language user story with observable expectations. It's *not* a test — it doesn't prescribe implementation. It describes what a satisfied user would experience.
 
-### Format: `scenarios/*.md`
+Each scenario is split into **two files** to enforce isolation between the capture agent and the judge:
+
+### Steps file: `scenarios/<id>.steps.md`
+
+The capture agent sees **only this file**. It contains the actions to perform and what to observe — but no success criteria, no anti-patterns, and no opinion about what "good" looks like. This prevents the capture agent from editorializing about pass/fail, which would bias the judge.
 
 ```markdown
 ---
 id: new-user-onboarding
 category: happy-path
-priority: critical
 timeout: 120
 setup: App running at http://localhost:3000
 ---
@@ -152,6 +157,26 @@ setup wizard.
 3. Fill in email and password
 4. Complete the 3-step onboarding wizard
 5. Arrive at the dashboard
+```
+
+**Key format requirements for steps files:**
+- The `id` in frontmatter must match the filename (e.g., `new-user-onboarding.steps.md` has `id: new-user-onboarding`)
+- `timeout` is in seconds (numeric, no unit suffix)
+- `setup` is a plain-text description of preconditions, not executable commands
+- Steps should describe observable actions ("click", "fill in", "navigate to") and what to look at — **not** what the expected outcome should be
+- No `## Satisfaction Criteria` or `## Anti-Patterns` sections — those belong in the criteria file
+
+### Criteria file: `scenarios/<id>.criteria.md`
+
+The judge sees **only this file** plus the trace evidence. It contains the satisfaction criteria and anti-patterns — the rubric for evaluation. The capture agent never sees this file.
+
+```markdown
+---
+id: new-user-onboarding
+priority: critical
+---
+
+# New User Onboarding — Judgment Criteria
 
 ## Satisfaction Criteria
 - **dashboard_reached**: The user reaches the dashboard within a reasonable number of interactions
@@ -166,18 +191,25 @@ setup wizard.
 - Dashboard loads but shows no user context
 ```
 
-**Key format requirements:**
-- The `id` in frontmatter must match the filename (e.g., `new-user-onboarding.md` has `id: new-user-onboarding`)
-- `timeout` is in seconds (numeric, no unit suffix)
-- `setup` is a plain-text description of preconditions, not executable commands
+**Key format requirements for criteria files:**
+- The `id` must match the corresponding steps file
+- `priority` lives here (not in the steps file) — it's a judgment concern, not a capture concern
 - Satisfaction Criteria are keyed with bold IDs (e.g., `**criterion_id**`) — these appear in judgment output and `failures.jsonl`
 - The section is called `## Anti-Patterns` (not `## Anti-patterns`)
 
+### Why two files?
+
+The capture agent is an LLM. If it sees the satisfaction criteria, it starts adding commentary like "this criterion appears to be met" or "the story outline was not visible, which would fail the sidebar_shows_outline criterion." This editorial commentary biases the judge — the judge reads the trace and inherits the capture agent's opinion instead of forming its own from raw evidence.
+
+By splitting the files, the capture agent can only observe and describe. It doesn't know what "good" looks like, so it can't inject pass/fail signals into the trace. The judge gets uncontaminated evidence.
+
 ### Scenario Design Principles
 
-**Write for an LLM judge, not a test runner.** The judge reads the criteria and the trace, then decides. Criteria should be things a thoughtful QA person would check — not pixel-exact assertions.
+**Write steps for a naive observer.** The capture agent should describe what it sees, not evaluate what it sees. Steps like "Arrive at the dashboard" are good. Steps like "Verify the dashboard loads correctly" invite the agent to editorialize.
 
-**Separate "critical" from "nice-to-have."** Use the `priority` field. A critical scenario failing means the build is broken. A low-priority scenario failing is signal but not blocking.
+**Write criteria for a skeptical judge.** The judge reads the criteria and the trace, then decides. Criteria should be things a thoughtful QA person would check — not pixel-exact assertions.
+
+**Separate "critical" from "nice-to-have."** Use the `priority` field in the criteria file. A critical scenario failing means the build is broken. A low-priority scenario failing is signal but not blocking.
 
 **Include adversarial scenarios.** What happens when the user submits garbage? Hits the back button mid-flow? Sends a 10MB payload? These catch reward-hacking where the agent makes the happy path work but ignores edge cases.
 
@@ -290,16 +322,16 @@ RUN_COUNT="${2:-1}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCENARIOS_DIR="${SCRIPT_DIR}/scenarios"
 
-# Collect scenario files to process
+# Collect scenario step files to process (only .steps.md — never .criteria.md)
 if [ "${SCENARIO_ID}" = "all" ]; then
-  SCENARIO_FILES=("${SCENARIOS_DIR}"/*.md)
+  SCENARIO_FILES=("${SCENARIOS_DIR}"/*.steps.md)
 else
-  SCENARIO_FILES=("${SCENARIOS_DIR}/${SCENARIO_ID}.md")
+  SCENARIO_FILES=("${SCENARIOS_DIR}/${SCENARIO_ID}.steps.md")
 fi
 
-for SCENARIO_FILE in "${SCENARIO_FILES[@]}"; do
-  CURRENT_ID="$(basename "${SCENARIO_FILE}" .md)"
-  SCENARIO_CONTENT="$(cat "${SCENARIO_FILE}")"
+for STEPS_FILE in "${SCENARIO_FILES[@]}"; do
+  CURRENT_ID="$(basename "${STEPS_FILE}" .steps.md)"
+  STEPS_CONTENT="$(cat "${STEPS_FILE}")"
 
   for RUN in $(seq 1 "${RUN_COUNT}"); do
     TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
@@ -307,21 +339,25 @@ for SCENARIO_FILE in "${SCENARIO_FILES[@]}"; do
     mkdir -p "${TRACE_DIR}"
 
     CAPTURE_PROMPT="You are a QA tester using a web browser via Playwright MCP tools. \
-Your job is to execute the following test scenario and document everything you observe.
+Your job is to execute the following steps and document everything you observe. \
+Report only what you see — do not evaluate whether the application is working \
+correctly or incorrectly. Describe, do not judge.
 
-## Scenario
-${SCENARIO_CONTENT}
+## Steps
+${STEPS_CONTENT}
 
 ## Instructions
-1. Follow the steps described in the scenario exactly
+1. Follow the steps described above exactly
 2. After each step, take a screenshot and describe what you see
-3. Note any errors, unexpected behavior, or deviations from expected results
-4. If a step fails, still attempt remaining steps and document the failure
+3. Note what you observe — describe the state of the screen factually
+4. If a step cannot be completed, still attempt remaining steps and document what happened
 5. At the end, write a complete trace summary
 
 ## Output
 Write your complete trace (all observations, screenshots taken, and summary) as a \
-detailed markdown report. Be factual — describe what you literally see on screen."
+detailed markdown report. Be factual — describe what you literally see on screen. \
+Do not assess whether criteria are met. Do not state whether something is working \
+or broken. Just describe what is there."
 
     # Run from /tmp to prevent Claude from reading CLAUDE.md (anti-contamination)
     # Stream output to terminal via stream-filter.py, save final JSON for extraction
@@ -348,6 +384,7 @@ done
 
 **Key implementation details:**
 
+- **Steps-only isolation:** The capture agent reads `<id>.steps.md` — never `<id>.criteria.md`. It doesn't know what "success" looks like, so it can't inject pass/fail opinions into the trace. This produces uncontaminated evidence for the judge.
 - **Anti-contamination:** All `claude -p` calls run from a `(cd /tmp && ...)` subshell so the spawned Claude cannot read `CLAUDE.md` or other repo files, which would bias the capture or judgment.
 - **Streaming output:** Uses `--output-format stream-json --verbose` piped through `stream-filter.py` to show real-time assistant text on the terminal while capturing the full result JSON for trace extraction.
 - **Tool restriction:** Only `mcp__playwright__*` tools are allowed — no file system access, no bash. The agent drives the browser and reports back; it doesn't write files to disk.
@@ -544,7 +581,7 @@ set -euo pipefail
 # Usage: bash judge.sh <scenario-id> [trace-dir]
 SCENARIO_ID="${1:?Usage: judge.sh <scenario-id> [trace-dir]}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SCENARIO_FILE="${SCRIPT_DIR}/scenarios/${SCENARIO_ID}.md"
+CRITERIA_FILE="${SCRIPT_DIR}/scenarios/${SCENARIO_ID}.criteria.md"
 
 # Find the latest trace (or use provided trace-dir)
 if [ -n "${2:-}" ]; then
@@ -555,13 +592,13 @@ else
   TRACE_DIR="${TRACE_DIR%/}"
 fi
 
-# Assemble judge input — full scenario + full trace
-SCENARIO_CONTENT="$(cat "${SCENARIO_FILE}")"
+# Assemble judge input — criteria (not steps) + trace evidence
+CRITERIA_CONTENT="$(cat "${CRITERIA_FILE}")"
 TRACE_CONTENT="$(cat "${TRACE_DIR}/trace-summary.md")"
 
-JUDGE_INPUT="# Scenario Under Test
+JUDGE_INPUT="# Judgment Criteria
 
-${SCENARIO_CONTENT}
+${CRITERIA_CONTENT}
 
 # Evidence Report (Trace Summary)
 
@@ -569,8 +606,9 @@ ${TRACE_CONTENT}
 
 # Your Task
 
-Evaluate the trace evidence against each satisfaction criterion listed in the
-scenario. Check for any anti-patterns.
+Evaluate the trace evidence against each satisfaction criterion. Check for any
+anti-patterns. The evidence was gathered by a separate observer — assess it on
+its own merits.
 
 IMPORTANT: Your entire response must be a single valid JSON object — no prose,
 no markdown, no explanation. Output ONLY the JSON object."
@@ -626,7 +664,7 @@ done
 
 **Key implementation details:**
 
-- **The prompt passes the full scenario markdown** (frontmatter + description + steps + criteria + anti-patterns) as a single block, not extracted sections. The judge sees everything the scenario author wrote.
+- **The judge receives only the criteria file** (`<id>.criteria.md`) — never the steps file. The judge doesn't need to know the steps; it evaluates the trace evidence against the satisfaction criteria and anti-patterns. This mirrors the capture-side isolation: the capture agent sees only steps, the judge sees only criteria.
 - **Self-correction retry loop:** If the judge's JSON output fails schema validation, the error is fed back as a new prompt (up to 2 retries). This catches common issues like the judge wrapping JSON in markdown fences or using a `criteria` object instead of `criteria_results` array.
 - **`extract-judgment.py`** handles the envelope extraction, normalizes schema variants (e.g., `criteria` dict → `criteria_results` array, anti-pattern objects → strings), and validates against `judgment-schema.json` using the `jsonschema` Python package.
 - **`stream-filter.py`** displays the judge's reasoning on the terminal in real-time (dimmed text + highlighted tool calls) while capturing the final result JSON to disk. This is valuable for understanding *why* the judge ruled the way it did.
@@ -688,10 +726,10 @@ mkdir -p "${JUDGMENT_DIR}"
 SATISFIED=0; UNSATISFIED=0; INSUFFICIENT=0; TOTAL=0
 CRITICAL_FAILURES=()
 
-for SCENARIO_FILE in "${SCENARIOS_DIR}"/*.md; do
-  SCENARIO_ID="$(basename "${SCENARIO_FILE}" .md)"
+for CRITERIA_FILE in "${SCENARIOS_DIR}"/*.criteria.md; do
+  SCENARIO_ID="$(basename "${CRITERIA_FILE}" .criteria.md)"
   TRACES_BASE="${TRACES_DIR}/${SCENARIO_ID}"
-  PRIORITY=$(sed -n 's/^priority: *//p' "${SCENARIO_FILE}" | tr -d '[:space:]')
+  PRIORITY=$(sed -n 's/^priority: *//p' "${CRITERIA_FILE}" | tr -d '[:space:]')
 
   # Find the latest trace for this scenario
   if [ ! -d "${TRACES_BASE}" ]; then
@@ -706,13 +744,13 @@ for SCENARIO_FILE in "${SCENARIOS_DIR}"/*.md; do
     continue
   fi
 
-  # Assemble judge input — full scenario + full trace
-  SCENARIO_CONTENT="$(cat "${SCENARIO_FILE}")"
+  # Assemble judge input — criteria only (not steps) + trace evidence
+  CRITERIA_CONTENT="$(cat "${CRITERIA_FILE}")"
   TRACE_CONTENT="$(cat "${TRACE_DIR}/trace-summary.md")"
 
-  JUDGE_INPUT="# Scenario Under Test
+  JUDGE_INPUT="# Judgment Criteria
 
-${SCENARIO_CONTENT}
+${CRITERIA_CONTENT}
 
 # Evidence Report (Trace Summary)
 
@@ -720,8 +758,9 @@ ${TRACE_CONTENT}
 
 # Your Task
 
-Evaluate the trace evidence against each satisfaction criterion listed in the
-scenario. Check for any anti-patterns.
+Evaluate the trace evidence against each satisfaction criterion. Check for any
+anti-patterns. The evidence was gathered by a separate observer — assess it on
+its own merits.
 
 IMPORTANT: Your entire response must be a single valid JSON object."
 
@@ -908,7 +947,7 @@ set -euo pipefail
 
 SCENARIO_ID="${1:?Usage: judge-codex.sh <scenario-id> [trace-dir]}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SCENARIO_FILE="${SCRIPT_DIR}/scenarios/${SCENARIO_ID}.md"
+CRITERIA_FILE="${SCRIPT_DIR}/scenarios/${SCENARIO_ID}.criteria.md"
 
 # Find the latest trace (or use provided trace-dir)
 if [ -n "${2:-}" ]; then
@@ -923,8 +962,8 @@ JUDGMENT_DIR="${SCRIPT_DIR}/judgments/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "${JUDGMENT_DIR}"
 JUDGMENT_FILE="${JUDGMENT_DIR}/${SCENARIO_ID}.json"
 
-# Assemble evidence — same structure as Claude judge
-SCENARIO_CONTENT="$(cat "${SCENARIO_FILE}")"
+# Assemble evidence — criteria only (not steps) + trace
+CRITERIA_CONTENT="$(cat "${CRITERIA_FILE}")"
 TRACE_CONTENT="$(cat "${TRACE_DIR}/trace-summary.md")"
 JUDGE_PROMPT="$(cat "${SCRIPT_DIR}/judge-prompt.md")"
 
@@ -932,9 +971,9 @@ FULL_PROMPT="${JUDGE_PROMPT}
 
 ---
 
-# Scenario Under Test
+# Judgment Criteria
 
-${SCENARIO_CONTENT}
+${CRITERIA_CONTENT}
 
 # Evidence Report (Trace Summary)
 
